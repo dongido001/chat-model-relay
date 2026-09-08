@@ -7,6 +7,7 @@ import json
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 from starlette.requests import Request
 from fastapi import HTTPException
@@ -1036,7 +1037,7 @@ class ResponsesAPITests(unittest.TestCase):
             messages=[first, ChatMessage(role="assistant", content="ok"), follow_up],
             user="githubcopilotchat",
         )
-        with unittest.mock.patch.object(Config, "API_DERIVE_CONVERSATION_ID", True):
+        with patch.object(openai_routes_module.Config, "API_DERIVE_CONVERSATION_ID", True):
             isolated1 = _apply_isolated_conversation_id(req1, None, False)
             isolated2 = _apply_isolated_conversation_id(req2, None, False)
         seed = _first_user_conversation_seed(req1.messages)
@@ -1048,7 +1049,7 @@ class ResponsesAPITests(unittest.TestCase):
     def test_isolated_conversation_id_uses_session_header(self) -> None:
         req = ChatCompletionRequest(messages=[ChatMessage(role="user", content="hello")])
         http_req = _make_request({"x-session-id": "cursor-thread-42"})
-        with unittest.mock.patch.object(Config, "API_DERIVE_CONVERSATION_ID", True):
+        with patch.object(openai_routes_module.Config, "API_DERIVE_CONVERSATION_ID", True):
             isolated = _apply_isolated_conversation_id(req, http_req, False)
         self.assertEqual(isolated.conversation_id, "cursor-thread-42")
 
@@ -1057,7 +1058,7 @@ class ResponsesAPITests(unittest.TestCase):
             messages=[ChatMessage(role="user", content="hello")],
             conversation_id="keep-me",
         )
-        with unittest.mock.patch.object(Config, "API_DERIVE_CONVERSATION_ID", True):
+        with patch.object(openai_routes_module.Config, "API_DERIVE_CONVERSATION_ID", True):
             same = _apply_isolated_conversation_id(req, None, False)
             fresh = _apply_isolated_conversation_id(
                 ChatCompletionRequest(messages=[ChatMessage(role="user", content="hello")]),
@@ -1069,7 +1070,7 @@ class ResponsesAPITests(unittest.TestCase):
 
     def test_isolated_conversation_id_can_be_disabled(self) -> None:
         req = ChatCompletionRequest(messages=[ChatMessage(role="user", content="hello")])
-        with unittest.mock.patch.object(Config, "API_DERIVE_CONVERSATION_ID", False):
+        with patch.object(openai_routes_module.Config, "API_DERIVE_CONVERSATION_ID", False):
             isolated = _apply_isolated_conversation_id(req, None, False)
         self.assertFalse(isolated.conversation_id)
 
