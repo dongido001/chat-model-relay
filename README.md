@@ -13,6 +13,9 @@ Chat Model Relay turns a logged-in browser session into familiar API endpoints. 
 
 The core flow is simple: **VS Code or another client → Chat Model Relay gateway → persistent browser/provider → normalized API response**. VS Code is the primary target; Cursor, Cline, and other compatible clients are supported as compatibility targets and should be verified in your own setup.
 
+> **Experimental software and disclaimer**
+> Chat Model Relay is provided for experimentation and personal testing. Use it at your own risk. The authors and contributors are not responsible for damage, data loss, account restrictions, service interruptions, or misuse resulting from this project. Follow the terms and policies of every provider you connect, and never expose the gateway or commit credentials without securing it first.
+
 ## Core capabilities
 
 - **Client-compatible API surfaces:** OpenAI-compatible endpoints let VS Code and other IDE tools connect to the configured provider. Available model IDs and capabilities depend on the provider and endpoint.
