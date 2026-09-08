@@ -1,0 +1,204 @@
+services:
+  # CatGPT Gateway - Enhanced Container Mock for Chat Apps
+  catgpt:
+    # Build and run only the local checkout. Compose never pulls or publishes it.
+    image: catgpt:local
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: catgpt
+    security_opt:
+      - seccomp=unconfined
+      - no-new-privileges:true
+    restart: unless-stopped
+    shm_size: "4gb"
+    deploy:
+      resources:
+        limits:
+          pids: 512
+    networks:
+      - app_services
+    ports:
+      - "127.0.0.1:8650:8000" # API Port (local machine only)
+      - "127.0.0.1:5800:5800" # jlesage Web GUI (local machine only)
+      # - "5900:5900" # Direct VNC port (optional)
+    tmpfs:
+      - /tmp:exec,mode=1777
+      - /app/browser_data/Default/Cache:mode=1777
+      - /app/browser_data/Default/Code Cache:mode=1777
+    environment:
+      # Application GUI (jlesage)
+      APP_NAME: "Chat Model Relay"
+      SECURE_CONNECTION: "0"
+      KEEP_APP_RUNNING: "1"
+      USER_ID: ${RELAY_USER_ID:-${CATGPT_USER_ID:-1000}}
+      GROUP_ID: ${RELAY_GROUP_ID:-${CATGPT_GROUP_ID:-1000}}
+      DISPLAY_WIDTH: 1366
+      DISPLAY_HEIGHT: 768
+      # Browser (headed on virtual display)
+      HEADLESS: "false"
+      SLOW_MO: ${SLOW_MO:-0}
+      # Provider: "chatgpt", "claude", "gemini", or "minimax"
+      PROVIDER: ${PROVIDER:-chatgpt}
+      # ChatGPT
+      CHATGPT_URL: "https://chatgpt.com"
+      CHATGPT_PROJECT_URL: ${CHATGPT_PROJECT_URL:-}
+      # MiniMax API
+      MINIMAX_REGION: ${MINIMAX_REGION:-global_en}
+      MINIMAX_BASE_URL: ${MINIMAX_BASE_URL:-}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      MINIMAX_MODEL: ${MINIMAX_MODEL:-MiniMax-M2.7}
+      # Timeouts
+      RESPONSE_TIMEOUT: 180000
+      SELECTOR_TIMEOUT: 10000
+      # Cursor Agent system+history is huge; never paste it into the composer.
+      CHATGPT_LONG_PROMPT_THRESHOLD: "8000"
+      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-3}
+      MAX_ACTIVE_TABS: ${MAX_ACTIVE_TABS:-4}
+      # Human simulation — keep light; Cutline-style bulk paste does not need long pauses
+      TYPING_SPEED_MIN: 20
+      TYPING_SPEED_MAX: 60
+      THINKING_PAUSE_MIN: 50
+      THINKING_PAUSE_MAX: 150
+      POLL_INTERVAL_MS: 150
+      RESPONSE_SETTLE_MS: 200
+      NAVIGATION_SETTLE_MS: 400
+      STOP_BUTTON_POLL_MS: 400
+      # API
+      API_HOST: "0.0.0.0"
+      API_PORT: 8000
+      # Local-only compose setup: ports are bound to 127.0.0.1, so credentials
+      # are optional. Set RELAY_API_KEY and API_TOKEN_OPTIONAL=false before
+      # exposing this service through any proxy or another network.
+      API_TOKEN: ${RELAY_API_KEY:-${CATGPT_API_KEY:-}}
+      API_TOKEN_OPTIONAL: ${API_TOKEN_OPTIONAL:-true}
+      API_CORS_ORIGINS: ${API_CORS_ORIGINS:-}
+      # Optional: keep large system instructions in thread context and send compact reminders
+      API_THREAD_CONTRACT_MODE: "true"
+      API_THREAD_CONTRACT_TTL_SECONDS: 3600
+      # Isolate Cursor/Copilot chats that omit conversation_id (set false to coalesce by app)
+      API_DERIVE_CONVERSATION_ID: ${API_DERIVE_CONVERSATION_ID:-true}
+      # Optional: map request.user to dedicated chat threads for app-level isolation
+      API_APP_THREAD_MODE: "true"
+      API_APP_THREAD_TTL_SECONDS: 86400
+      # Optional: merge header-only rows into the next item's note/context in structured JSON outputs
+      API_HEADER_ROW_MERGE_MODE: "true"
+      API_APP_THREAD_DELETE_EXPIRED: "true"
+      # Durable OpenAI conversation and Responses API routing
+      API_CONVERSATION_DB: /app/state/conversations.sqlite3
+      API_CONVERSATION_RETENTION_SECONDS: ${API_CONVERSATION_RETENTION_SECONDS:-2592000}
+      API_CONVERSATION_MAX_ROUTES: ${API_CONVERSATION_MAX_ROUTES:-10000}
+      API_TRACE_ENABLED: ${API_TRACE_ENABLED:-false}
+      API_TRACE_DIR: /app/state/traces
+      API_TRACE_MAX_CHARS: ${API_TRACE_MAX_CHARS:-200000}
+      API_TRACE_INCLUDE_CONTENT: ${API_TRACE_INCLUDE_CONTENT:-false}
+      API_TOOL_RESULT_MAX_CHARS: ${API_TOOL_RESULT_MAX_CHARS:-20000}
+      # The GUI is loopback-only. A password is optional for local development.
+      VNC_PASSWORD: ${RELAY_VNC_PASSWORD:-${CATGPT_VNC_PASSWORD:-}}
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      VERBOSE: ${VERBOSE:-false}
+    volumes:
+      - ${DOCKERDIR:-.}/appdata/catgpt/config:/config
+      - ${DOCKERDIR:-.}/appdata/catgpt/browser:/app/browser_data
+      - ${DOCKERDIR:-.}/appdata/catgpt/logs:/app/logs
+      - ${DOCKERDIR:-.}/appdata/catgpt/state:/app/state
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  # Second gateway: Gemini web login (same image, separate profile/ports).
+  catgpt-gemini:
+    image: catgpt:local
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: catgpt-gemini
+    security_opt:
+      - seccomp=unconfined
+      - no-new-privileges:true
+    restart: unless-stopped
+    shm_size: "4gb"
+    deploy:
+      resources:
+        limits:
+          pids: 512
+    networks:
+      - app_services
+    ports:
+      - "127.0.0.1:8651:8000"
+      - "127.0.0.1:5801:5800"
+    tmpfs:
+      - /tmp:exec,mode=1777
+      - /app/browser_data/Default/Cache:mode=1777
+      - /app/browser_data/Default/Code Cache:mode=1777
+    environment:
+      APP_NAME: "Chat Model Relay Gemini"
+      SECURE_CONNECTION: "0"
+      KEEP_APP_RUNNING: "1"
+      USER_ID: ${RELAY_USER_ID:-${CATGPT_USER_ID:-1000}}
+      GROUP_ID: ${RELAY_GROUP_ID:-${CATGPT_GROUP_ID:-1000}}
+      DISPLAY_WIDTH: 1366
+      DISPLAY_HEIGHT: 768
+      HEADLESS: "false"
+      SLOW_MO: ${SLOW_MO:-0}
+      PROVIDER: gemini
+      GEMINI_URL: "https://gemini.google.com/app"
+      BROWSER_DATA_DIR: /app/browser_data
+      RESPONSE_TIMEOUT: 180000
+      SELECTOR_TIMEOUT: 10000
+      CHATGPT_LONG_PROMPT_THRESHOLD: "8000"
+      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-3}
+      MAX_ACTIVE_TABS: ${MAX_ACTIVE_TABS:-4}
+      TYPING_SPEED_MIN: 20
+      TYPING_SPEED_MAX: 60
+      THINKING_PAUSE_MIN: 50
+      THINKING_PAUSE_MAX: 150
+      POLL_INTERVAL_MS: 150
+      RESPONSE_SETTLE_MS: 200
+      NAVIGATION_SETTLE_MS: 400
+      STOP_BUTTON_POLL_MS: 400
+      API_HOST: "0.0.0.0"
+      API_PORT: 8000
+      API_TOKEN: ${RELAY_API_KEY:-${CATGPT_API_KEY:-}}
+      API_TOKEN_OPTIONAL: ${API_TOKEN_OPTIONAL:-true}
+      API_CORS_ORIGINS: ${API_CORS_ORIGINS:-}
+      API_THREAD_CONTRACT_MODE: "true"
+      API_THREAD_CONTRACT_TTL_SECONDS: 3600
+      API_DERIVE_CONVERSATION_ID: ${API_DERIVE_CONVERSATION_ID:-true}
+      API_APP_THREAD_MODE: "true"
+      API_APP_THREAD_TTL_SECONDS: 86400
+      API_HEADER_ROW_MERGE_MODE: "true"
+      API_APP_THREAD_DELETE_EXPIRED: "true"
+      API_CONVERSATION_DB: /app/state/conversations.sqlite3
+      API_CONVERSATION_RETENTION_SECONDS: ${API_CONVERSATION_RETENTION_SECONDS:-2592000}
+      API_CONVERSATION_MAX_ROUTES: ${API_CONVERSATION_MAX_ROUTES:-10000}
+      API_TRACE_ENABLED: ${API_TRACE_ENABLED:-false}
+      API_TRACE_DIR: /app/state/traces
+      API_TRACE_MAX_CHARS: ${API_TRACE_MAX_CHARS:-200000}
+      API_TRACE_INCLUDE_CONTENT: ${API_TRACE_INCLUDE_CONTENT:-false}
+      API_TOOL_RESULT_MAX_CHARS: ${API_TOOL_RESULT_MAX_CHARS:-20000}
+      VNC_PASSWORD: ${RELAY_VNC_PASSWORD:-${CATGPT_VNC_PASSWORD:-}}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      VERBOSE: ${VERBOSE:-false}
+    volumes:
+      - ${DOCKERDIR:-.}/appdata/catgpt-gemini/config:/config
+      - ${DOCKERDIR:-.}/appdata/catgpt-gemini/browser:/app/browser_data
+      - ${DOCKERDIR:-.}/appdata/catgpt-gemini/logs:/app/logs
+      - ${DOCKERDIR:-.}/appdata/catgpt-gemini/state:/app/state
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+networks:
+  app_services:
+    name: app_services
+    driver: bridge

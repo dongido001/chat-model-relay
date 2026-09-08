@@ -1,0 +1,240 @@
+"""
+API routes — FastAPI router for ChatGPT interaction.
+
+Endpoints:
+  POST /chat              Send a message in the current/new thread
+  POST /thread/{id}/chat  Send a message in a specific thread
+  POST /thread/new        Start a new conversation
+  GET  /threads           List recent threads
+  GET  /status            Health check + login status
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, HTTPException
+
+from src.api.browser_gate import CONTROL_SESSION, acquire_browser_page, browser_access_lock
+from src.api.schemas import (
+    ChatRequest,
+    ChatResponse,
+    AudioInfoResponse,
+    ImageInfoResponse,
+    StatusResponse,
+    ThreadInfo,
+    ThreadListResponse,
+)
+from src.browser.manager import BrowserManager
+from src.chatgpt.client import ChatGPTClient
+from src.chatgpt.errors import PromptAttachmentFallbackError, PromptTooLongError
+from src.chatgpt.model_registry import is_supported_chat_model, list_public_chat_models
+from src.claude.client import ClaudeClient
+from src.gemini.client import GeminiClient
+from src.minimax.client import MiniMaxClient
+from src.config import Config
+from src.log import setup_logging
+
+log = setup_logging("api_routes")
+
+router = APIRouter()
+
+# Global reference — set by the server on startup
+_client: ChatGPTClient | ClaudeClient | GeminiClient | MiniMaxClient | None = None
+_browser: BrowserManager | None = None
+
+
+def set_client(
+    client: ChatGPTClient | ClaudeClient | GeminiClient | MiniMaxClient,
+    browser: BrowserManager | None,
+) -> None:
+    """Called by server.py to inject the active provider client instance."""
+    global _client, _browser
+    _client = client
+    _browser = browser
+
+
+def _get_client():
+    if _client is None:
+        raise HTTPException(status_code=503, detail="Client not initialized")
+    return _client
+
+
+def _bind_client(client, page):
+    bind_page = getattr(client, "bind_page", None)
+    if page is None or not callable(bind_page):
+        return client
+    return bind_page(page)
+
+
+def _build_response(result) -> ChatResponse:
+    """Convert internal ChatResponse to API ChatResponse with image data."""
+    images = [
+        ImageInfoResponse(
+            url=img.url,
+            alt=img.alt,
+            local_path=img.local_path,
+            prompt_title=img.prompt_title,
+        )
+        for img in (result.images or [])
+    ]
+    audio = None
+    if result.audio:
+        audio = AudioInfoResponse(
+            url=result.audio.url,
+            local_path=result.audio.local_path,
+            mime_type=result.audio.mime_type,
+            size_bytes=result.audio.size_bytes,
+        )
+    return ChatResponse(
+        message=result.message,
+        thread_id=result.thread_id,
+        response_time_ms=result.response_time_ms,
+        images=images,
+        has_images=result.has_images,
+        audio=audio,
+        has_audio=result.has_audio,
+    )
+
+
+def _validate_model(model: str | None) -> None:
+    """Reject unsupported browser model ids early for the native REST routes."""
+    if Config.PROVIDER != "chatgpt":
+        try:
+            Config.resolve_model_id(model)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return
+    if not model:
+        return
+    if is_supported_chat_model(model):
+        return
+
+    supported = ", ".join(list_public_chat_models())
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unsupported model '{model}'. Supported models: {supported}",
+    )
+
+
+# ── Chat ────────────────────────────────────────────────────────
+
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest) -> ChatResponse:
+    """Send a message in the current conversation."""
+    log.info(f"POST /chat — {len(req.message)} chars")
+
+    async with acquire_browser_page(CONTROL_SESSION) as lease:
+        client = _bind_client(_get_client(), lease.page)
+        try:
+            _validate_model(req.model)
+            result = await client.send_message(
+                req.message,
+                model=req.model,
+                read_aloud=req.read_aloud,
+            )
+            return _build_response(result)
+        except PromptTooLongError as e:
+            log.warning("ChatGPT rejected an oversized prompt: %s", e)
+            raise HTTPException(status_code=413, detail=str(e)) from e
+        except PromptAttachmentFallbackError as e:
+            log.error("Long-prompt attachment fallback failed: %s", e, exc_info=True)
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        except Exception as e:
+            log.error(f"Chat error: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/thread/{thread_id}/chat", response_model=ChatResponse)
+async def chat_in_thread(thread_id: str, req: ChatRequest) -> ChatResponse:
+    """Send a message in a specific thread. Navigates to it first."""
+    log.info(f"POST /thread/{thread_id}/chat — {len(req.message)} chars")
+
+    async with acquire_browser_page(CONTROL_SESSION) as lease:
+        client = _bind_client(_get_client(), lease.page)
+        try:
+            _validate_model(req.model)
+            current_tid = client._extract_thread_id()
+            if current_tid != thread_id:
+                await client.navigate_to_thread(thread_id)
+
+            result = await client.send_message(
+                req.message,
+                model=req.model,
+                read_aloud=req.read_aloud,
+            )
+            return _build_response(result)
+        except PromptTooLongError as e:
+            log.warning("ChatGPT rejected an oversized prompt: %s", e)
+            raise HTTPException(status_code=413, detail=str(e)) from e
+        except PromptAttachmentFallbackError as e:
+            log.error("Long-prompt attachment fallback failed: %s", e, exc_info=True)
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        except Exception as e:
+            log.error(f"Thread chat error: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/thread/new", response_model=ChatResponse)
+async def new_thread(req: ChatRequest) -> ChatResponse:
+    """Start a new conversation and send the first message."""
+    log.info(f"POST /thread/new — {len(req.message)} chars")
+
+    async with acquire_browser_page(CONTROL_SESSION) as lease:
+        client = _bind_client(_get_client(), lease.page)
+        try:
+            _validate_model(req.model)
+            await client.new_chat()
+            result = await client.send_message(
+                req.message,
+                model=req.model,
+                read_aloud=req.read_aloud,
+            )
+            return _build_response(result)
+        except PromptTooLongError as e:
+            log.warning("ChatGPT rejected an oversized prompt: %s", e)
+            raise HTTPException(status_code=413, detail=str(e)) from e
+        except PromptAttachmentFallbackError as e:
+            log.error("Long-prompt attachment fallback failed: %s", e, exc_info=True)
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        except Exception as e:
+            log.error(f"New thread error: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Threads ─────────────────────────────────────────────────────
+
+
+@router.get("/threads", response_model=ThreadListResponse)
+async def list_threads() -> ThreadListResponse:
+    """List recent conversation threads from the sidebar."""
+    log.info("GET /threads")
+
+    async with acquire_browser_page(CONTROL_SESSION) as lease:
+        client = _bind_client(_get_client(), lease.page)
+        try:
+            raw_threads = await client.list_threads()
+            threads = [
+                ThreadInfo(id=t["id"], title=t["title"], url=t["url"])
+                for t in raw_threads
+            ]
+            return ThreadListResponse(threads=threads)
+        except Exception as e:
+            log.error(f"Threads list error: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Status ──────────────────────────────────────────────────────
+
+
+@router.get("/status", response_model=StatusResponse)
+async def status() -> StatusResponse:
+    """Health check — returns login status and current thread."""
+    try:
+        client = _get_client()
+        async with acquire_browser_page(CONTROL_SESSION) as lease:
+            client = _bind_client(_get_client(), lease.page)
+            logged_in = True if _browser is None else await _browser.is_logged_in()
+            tid = client._extract_thread_id()
+            return StatusResponse(status="ok", logged_in=logged_in, current_thread=tid)
+    except Exception:
+        return StatusResponse(status="ok", logged_in=False, current_thread="")
