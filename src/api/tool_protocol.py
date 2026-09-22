@@ -290,19 +290,30 @@ def build_gemini_tool_repair_prompt(
 
 def parse_gemini_final_response(response_text: str) -> str | None:
     """Return a final answer only from an exact Gemini JSON response envelope."""
+    cleaned = (response_text or "").strip()
+    cleaned = re.sub(r"^(?:ChatGPT|Gemini|Claude)\s+said:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^You said:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    fenced = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    fenced = re.sub(r"\s*```$", "", fenced).strip()
+
     decoder = json.JSONDecoder(strict=False)
-    for candidate in _tool_call_json_candidates(response_text):
-        try:
-            parsed, end = decoder.raw_decode(candidate)
-        except json.JSONDecodeError:
+    seen: set[str] = set()
+    for candidate in (cleaned, fenced):
+        if not candidate.startswith("{") or candidate in seen:
             continue
-        if candidate[end:].strip() or not isinstance(parsed, dict):
-            continue
-        if set(parsed) != {"final"}:
-            continue
-        final = parsed.get("final")
-        if isinstance(final, str) and final.strip():
-            return final.strip()
+        seen.add(candidate)
+        for raw in (candidate, _repair_unescaped_json_string_quotes(candidate)):
+            try:
+                parsed, end = decoder.raw_decode(raw)
+            except json.JSONDecodeError:
+                continue
+            if raw[end:].strip() or not isinstance(parsed, dict):
+                continue
+            if set(parsed) != {"final"}:
+                continue
+            final = parsed.get("final")
+            if isinstance(final, str) and final.strip():
+                return final.strip()
     return None
 
 
@@ -396,11 +407,12 @@ def _tool_call_json_candidates(response_text: str) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
     for source in (text, fenced):
-        for match in re.finditer(r'\{\s*"tool_calls"\s*:', source):
-            snippet = source[match.start():].strip()
-            if snippet and snippet not in seen:
-                seen.add(snippet)
-                candidates.append(snippet)
+        for pattern in (r'\{\s*"tool_calls"\s*:', r'\{\s*"final"\s*:'):
+            for match in re.finditer(pattern, source):
+                snippet = source[match.start():].strip()
+                if snippet and snippet not in seen:
+                    seen.add(snippet)
+                    candidates.append(snippet)
         if source.startswith("{") and source not in seen:
             seen.add(source)
             candidates.append(source)

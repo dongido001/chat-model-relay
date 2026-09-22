@@ -237,6 +237,19 @@ class GeminiProviderTests(unittest.TestCase):
         self.assertIsNone(parse_gemini_final_response("ls -la ~/Projects"))
         self.assertIsNone(parse_gemini_final_response('{"final":"ok","extra":true}'))
 
+    def test_gemini_final_unwraps_prefixed_and_fenced_envelopes(self) -> None:
+        self.assertEqual(
+            parse_gemini_final_response('ChatGPT said:\n{"final":"Ready."}'),
+            "Ready.",
+        )
+        self.assertEqual(
+            parse_gemini_final_response('```json\n{"final":"Ready."}\n```'),
+            "Ready.",
+        )
+        self.assertIsNone(
+            parse_gemini_final_response('Here is the answer\\n{"final":"Ready."}')
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

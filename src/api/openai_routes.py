@@ -2801,11 +2801,7 @@ async def _execute_chat_completion(
                         repaired_text = repair_result.message
                         repair_outcome = _parse_tool_calls_outcome(repaired_text, request.tools)
                         repaired_calls = repair_outcome.calls
-                        repaired_final = (
-                            parse_gemini_final_response(repaired_text)
-                            if isinstance(client, GeminiClient)
-                            else None
-                        )
+                        repaired_final = parse_gemini_final_response(repaired_text)
                         repair_errors: list[str] = []
                         if repaired_calls:
                             repair_errors.extend(validate_tool_calls(
@@ -2852,6 +2848,14 @@ async def _execute_chat_completion(
                 if tool_calls:
                     finish_reason = "tool_calls"
                     response_text = None
+
+            # Always unwrap a transport {"final": ...} envelope before the
+            # client sees it. Browser models often keep that JSON even after
+            # the tool loop ends, and Cursor then renders the raw object.
+            if response_text and not tool_calls:
+                unwrapped_final = parse_gemini_final_response(response_text)
+                if unwrapped_final is not None:
+                    response_text = unwrapped_final
 
             # -- Build response ----------------------------------
             prompt_tokens = _estimate_tokens(prompt)
