@@ -78,9 +78,11 @@ from src.api.prompt_compaction import (
     _new_attachments_from_latest_user,
 )
 from src.api.thread_routing import (
+    _PROJECT_ID_HEADER,
     _conversation_id_from_request,
     _derive_app_key,
     _display_app_name,
+    _project_conversation_key,
     _responses_conversation_id,
     _session_id_from_request,
     _tab_session_key,
@@ -388,6 +390,40 @@ def _message_hash(message: ChatMessage | dict[str, Any]) -> str:
         _canonical_message(message), sort_keys=True, ensure_ascii=False, separators=(",", ":")
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _project_transcript_size(transcript: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> int:
+    return sum(
+        len(json.dumps(message, ensure_ascii=False, separators=(",", ":")))
+        for message in transcript
+    )
+
+
+def _project_rollover_context(
+    transcript: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> list[dict[str, Any]]:
+    """Keep a bounded recent user/assistant tail when a project chat rolls over."""
+    budget = Config.API_PROJECT_THREAD_CONTEXT_CHARS
+    kept: list[dict[str, Any]] = []
+    used = 0
+    for message in reversed(transcript):
+        if message.get("role") not in {"user", "assistant"}:
+            continue
+        if message.get("tool_calls") or not isinstance(message.get("content"), str):
+            continue
+        size = len(json.dumps(message, ensure_ascii=False, separators=(",", ":")))
+        if size > budget - used:
+            if not kept and budget > 0:
+                content = message.get("content")
+                if isinstance(content, str):
+                    clipped = dict(message)
+                    clipped["content"] = content[-budget:]
+                    kept.append(clipped)
+            break
+        kept.append(dict(message))
+        used += size
+    kept.reverse()
+    return kept
 
 
 def _messages_from_transcript(
@@ -1398,7 +1434,7 @@ async def list_models() -> ModelListResponse:
         except Exception as exc:
             log.warning("Could not refresh models from the live ChatGPT picker: %s", exc)
     return ModelListResponse(
-        data=[ModelObject(id=model_id, owned_by="catgpt") for model_id in list_public_chat_models()]
+        data=[ModelObject(id=model_id, owned_by="catgpt") for model_id in list_public_chat_models()] + [ModelObject(id="gemini-browser", owned_by="google")]
     )
 
 
@@ -1438,6 +1474,53 @@ async def create_image_scoped(
     )
 
 
+
+async def _forward_to_companion(port: int, request: ChatCompletionRequest, http_request: Request = None):
+    import httpx
+    from starlette.responses import StreamingResponse, JSONResponse
+    target_url = f"http://127.0.0.1:{port}/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if http_request and "authorization" in http_request.headers:
+        headers["Authorization"] = http_request.headers["authorization"]
+    payload = request.model_dump(exclude_unset=True)
+
+    try:
+        if request.stream:
+            client = httpx.AsyncClient(timeout=300.0)
+            req = client.build_request("POST", target_url, json=payload, headers=headers)
+            r = await client.send(req, stream=True)
+            if r.status_code != 200:
+                body = await r.aread()
+                await r.aclose()
+                await client.aclose()
+                return JSONResponse(status_code=r.status_code, content={"detail": body.decode("utf-8", errors="replace")})
+
+            async def stream_generator():
+                try:
+                    async for chunk in r.aiter_raw():
+                        yield chunk
+                finally:
+                    await r.aclose()
+                    await client.aclose()
+
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+        else:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                resp = await client.post(target_url, json=payload, headers=headers)
+                return JSONResponse(status_code=resp.status_code, content=resp.json())
+    except Exception:
+        provider_name = "Gemini" if port == 8651 else "ChatGPT"
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": f"{provider_name} companion worker is offline on port {port}. Start it from the unified dashboard at http://127.0.0.1:8650/admin",
+                    "type": "companion_offline_error"
+                }
+            }
+        )
+
+
 @openai_router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def create_chat_completion(
     request: ChatCompletionRequest,
@@ -1450,6 +1533,10 @@ async def create_chat_completion(
     via browser automation, and returns an OpenAI-formatted response.
     Supports tool/function calling via prompt injection.
     """
+    if Config.PROVIDER == "chatgpt" and request.model and "gemini" in request.model.lower():
+        return await _forward_to_companion(8651, request, http_request)
+    elif Config.PROVIDER == "gemini" and request.model and any(tok in request.model.lower() for tok in ("gpt", "catgpt", "o1", "o3")):
+        return await _forward_to_companion(8650, request, http_request)
     fresh_thread = _fresh_thread_from_header(http_request)
     _validate_chat_request(request, fresh_thread=fresh_thread)
     app_key = _resolve_app_key(request, http_request)
@@ -1727,11 +1814,27 @@ def _responses_input_to_messages(
     elif isinstance(input_data, list):
         for item in input_data:
             if isinstance(item, dict):
+                item_type = item.get("type") or "message"
                 role = item.get("role") or "user"
                 content = _normalize_content(item.get("content"))
+                if item_type == "function_call_output":
+                    messages.append(ChatMessage(
+                        role="tool",
+                        tool_call_id=item.get("call_id") or "",
+                        content=_normalize_content(item.get("output")),
+                    ))
+                    continue
             else:
+                item_type = getattr(item, "type", "message") or "message"
                 role = getattr(item, "role", "user") or "user"
                 content = _normalize_content(getattr(item, "content", None))
+                if item_type == "function_call_output":
+                    messages.append(ChatMessage(
+                        role="tool",
+                        tool_call_id=getattr(item, "call_id", "") or "",
+                        content=_normalize_content(getattr(item, "output", None)),
+                    ))
+                    continue
             messages.append(ChatMessage(role=role, content=content))
     else:
         messages.append(ChatMessage(role="user", content=str(input_data)))
@@ -1756,6 +1859,11 @@ def _responses_request_to_chat_request(
         top_p=resp_req.top_p,
         stream=resp_req.stream if resp_req.stream is not None else False,
         user=resp_req.user,
+        project_id=(
+            resp_req.project_id
+            or str((resp_req.metadata or {}).get("project_id") or "")
+            or None
+        ),
         reasoning_effort=resp_req.reasoning.effort if resp_req.reasoning else None,
         conversation_id=conversation_id or None,
         read_aloud=bool(resp_req.read_aloud),
@@ -1773,19 +1881,21 @@ def _responses_response_from_chat(
     output_items: list[ResponseOutputMessage | ResponseOutputToolCall] = []
 
     for choice in chat_response.choices:
-        msg_text = choice.message.content or ""
-        output_items.append(
-            ResponseOutputMessage(
-                content=[
-                    ResponseOutputText(text=msg_text),
-                ],
-            )
-        )
         tool_calls = choice.message.tool_calls or []
+        msg_text = choice.message.content or ""
+        if msg_text or not tool_calls:
+            output_items.append(
+                ResponseOutputMessage(
+                    content=[
+                        ResponseOutputText(text=msg_text),
+                    ],
+                )
+            )
         for call in tool_calls:
             output_items.append(
                 ResponseOutputToolCall(
                     id=call.id,
+                    call_id=call.id,
                     name=call.function.name,
                     arguments=call.function.arguments,
                 )
@@ -1924,20 +2034,93 @@ async def _stream_responses(
 
     async def _events():
         response_dict = _model_dump_compat(response, mode="json")
-        text = ""
-        for item in response.output:
-            if isinstance(item, ResponseOutputMessage):
-                text += "".join(part.text for part in item.content)
+        in_progress_response = {**response_dict, "status": "in_progress", "output": []}
+        yield _responses_sse_event(
+            "response.created",
+            {"type": "response.created", "response": in_progress_response},
+        )
+        yield _responses_sse_event(
+            "response.in_progress",
+            {"type": "response.in_progress", "response": in_progress_response},
+        )
 
-        if text:
+        # Codex's Responses client builds its visible answer from the item and
+        # content-part lifecycle, not from a bare output_text.delta event.  Emit
+        # the complete lifecycle even though the browser can only return one
+        # completed chunk at a time.
+        for output_index, item in enumerate(response.output):
+            item_dict = _model_dump_compat(item, mode="json")
+            pending_item = dict(item_dict)
+            if isinstance(item, ResponseOutputMessage):
+                pending_item["content"] = []
             yield _responses_sse_event(
-                "response.output_text.delta",
+                "response.output_item.added",
                 {
-                    "type": "response.output_text.delta",
+                    "type": "response.output_item.added",
                     "response_id": response.id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "delta": text,
+                    "output_index": output_index,
+                    "item": pending_item,
+                },
+            )
+
+            if isinstance(item, ResponseOutputMessage):
+                for content_index, part in enumerate(item.content):
+                    part_dict = _model_dump_compat(part, mode="json")
+                    item_id = item.id
+                    pending_part = {"type": "output_text", "text": "", "annotations": []}
+                    yield _responses_sse_event(
+                        "response.content_part.added",
+                        {
+                            "type": "response.content_part.added",
+                            "response_id": response.id,
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "content_index": content_index,
+                            "part": pending_part,
+                        },
+                    )
+                    if part.text:
+                        yield _responses_sse_event(
+                            "response.output_text.delta",
+                            {
+                                "type": "response.output_text.delta",
+                                "response_id": response.id,
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "content_index": content_index,
+                                "delta": part.text,
+                            },
+                        )
+                    yield _responses_sse_event(
+                        "response.output_text.done",
+                        {
+                            "type": "response.output_text.done",
+                            "response_id": response.id,
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "content_index": content_index,
+                            "text": part.text,
+                        },
+                    )
+                    yield _responses_sse_event(
+                        "response.content_part.done",
+                        {
+                            "type": "response.content_part.done",
+                            "response_id": response.id,
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "content_index": content_index,
+                            "part": part_dict,
+                        },
+                    )
+
+            yield _responses_sse_event(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "response_id": response.id,
+                    "output_index": output_index,
+                    "item": item_dict,
                 },
             )
 
@@ -1945,7 +2128,7 @@ async def _stream_responses(
             "response.completed",
             {
                 "type": "response.completed",
-                "response": response_dict,
+                "response": {**response_dict, "status": "completed"},
             },
         )
         yield "data: [DONE]\n\n"
@@ -2012,7 +2195,9 @@ async def _prepare_conversation_routing(
     """Resolve one logical conversation to a verified browser thread."""
     store = _get_conversation_store()
     project_key = _project_key()
-    namespace = app_key or "default"
+    # Project-scoped chats are shared across IDE clients; ordinary conversations
+    # retain their app isolation.
+    namespace = "project" if conversation_key.startswith("project:") else (app_key or "default")
     existing = store.get_route(project_key, namespace, conversation_key)
     incoming = [_canonical_message(message) for message in request.messages]
     incoming_hashes = [_message_hash(message) for message in incoming]
@@ -2028,6 +2213,34 @@ async def _prepare_conversation_routing(
         action = "new-response-branch"
     elif existing is None:
         await client.new_chat()
+    elif (
+        conversation_key.startswith("project:")
+        and Config.API_PROJECT_THREAD_MAX_CHARS > 0
+        and _project_transcript_size(existing.transcript) >= Config.API_PROJECT_THREAD_MAX_CHARS
+    ):
+        recent_context = _project_rollover_context(existing.transcript)
+        non_instruction = [
+            message for message in request.messages
+            if message.role not in {"system", "developer"}
+        ]
+        latest_turn = _latest_turn_messages(non_instruction, include_system=False)
+        additions = [_canonical_message(message) for message in latest_turn]
+        system_messages = [
+            _canonical_message(message) for message in request.messages
+            if message.role in {"system", "developer"}
+        ]
+        rollover_note = {
+            "role": "system",
+            "content": (
+                "This is a continuation of the same project after its previous ChatGPT thread "
+                "reached the size limit. Use the recent conversation excerpt below as context."
+            ),
+        }
+        transcript_input = [*system_messages, rollover_note, *recent_context, *additions]
+        messages_for_browser = _messages_from_transcript(transcript_input)
+        await client.new_chat()
+        existing = None
+        action = "project-thread-size-rotation"
     else:
         existing_hashes = list(existing.message_hashes)
         prefix_match = (
@@ -2069,15 +2282,16 @@ async def _prepare_conversation_routing(
             and existing.contract_hash != contract_hash
             and not conversation_key.startswith("derived:")
         ):
-            reconstructed = incoming if len(incoming) > 2 else [
-                dict(message) for message in existing.transcript
-                if message.get("role") not in {"system", "developer"}
-            ] + incoming
-            transcript_input = reconstructed
-            messages_for_browser = _messages_from_transcript(reconstructed)
-            await client.new_chat()
-            action = "new-chat-contract-change"
-            existing = None
+            # Codex refreshes its system/tool contract between turns.  A
+            # conversation key is the stronger signal: reopening a ChatGPT
+            # chat here loses the browser history even though the user stayed
+            # in the same Codex chat.  Keep the mapped thread and forward only
+            # the latest user/tool turn under the refreshed contract.
+            latest_turn = _latest_turn_messages(non_instruction, include_system=False)
+            additions = [_canonical_message(message) for message in latest_turn]
+            transcript_input = [*map(dict, existing.transcript), *additions]
+            messages_for_browser = latest_turn
+            action = "contract-change-delta"
         elif prefix_match:
             additions = incoming[len(existing_hashes):]
             if not additions:
@@ -2094,16 +2308,28 @@ async def _prepare_conversation_routing(
             messages_for_browser = list(non_instruction)
             action = "single-turn-delta"
         elif (
-            conversation_key.startswith("derived:")
+            (conversation_key.startswith("derived:") or conversation_key.startswith("project:"))
             and non_instruction
             and non_instruction[-1].role in {"user", "tool"}
         ):
-            # Copilot resends the full agent dump every turn; hashes never prefix-match.
-            latest = non_instruction[-1]
-            additions = [_canonical_message(latest)]
+            # Some editor clients resend a full agent dump on every request.
+            # A derived or project key identifies this replay-shaped Copilot flow; explicit
+            # conversation keys still treat mismatched histories as divergence.
+            # Forward only the final user/tool turn while preserving the mapped
+            # browser chat.
+            if non_instruction[-1].role == "user":
+                latest_turn = _latest_turn_messages(non_instruction, include_system=False)
+            else:
+                # Tool continuations must not replay the preceding user turn.
+                latest_turn = []
+                for message in reversed(non_instruction):
+                    if message.role != "tool":
+                        break
+                    latest_turn.insert(0, message)
+            additions = [_canonical_message(message) for message in latest_turn]
             transcript_input = [*map(dict, existing.transcript), *additions]
-            messages_for_browser = [latest]
-            action = "derived-replay-delta"
+            messages_for_browser = latest_turn
+            action = "derived-replay-delta" if conversation_key.startswith("derived:") else "project-replay-delta"
         else:
             await client.new_chat()
             action = "new-chat-history-diverged"
@@ -2164,6 +2390,17 @@ async def _execute_responses(
         else:
             conversation_id = f"response-branch:{request.previous_response_id}:{uuid.uuid4().hex[:12]}"
             seed_transcript = previous.transcript
+    if not conversation_id and not fresh_thread:
+        # Responses clients such as Codex may omit both ``conversation`` and
+        # ``previous_response_id``.  Do not mint a random routing key for each
+        # request in that case: it would make every turn open a new browser
+        # ChatGPT thread.  Reuse the same session-header/first-turn fallback
+        # used by Chat Completions before falling back to an isolated chain.
+        fallback_request = _responses_request_to_chat_request(request)
+        fallback_request = _apply_isolated_conversation_id(
+            fallback_request, http_request, fresh_thread=False
+        )
+        conversation_id = fallback_request.conversation_id or ""
     if not conversation_id:
         conversation_id = f"response-chain:{uuid.uuid4().hex}"
 
@@ -2181,8 +2418,10 @@ async def _execute_responses(
     route = _completion_route_outcomes.pop(chat_response.id, None)
     if route is not None and request.store is not False:
         _get_conversation_store().save_response(response.id, route)
-    elif route is not None and request.store is False and request.conversation is None and not request.previous_response_id:
-        _get_conversation_store().delete_route(route.project_key, route.app_key, route.conversation_key)
+    # ``store=false`` means the client does not want a retrievable Responses
+    # object.  It must not delete the relay's browser-thread route: Codex uses
+    # store=false, and removing that route after each reply forced every next
+    # turn to create a new ChatGPT conversation.
     return response
 
 async def _execute_chat_completion(
@@ -2218,8 +2457,27 @@ async def _execute_chat_completion(
         request = _model_copy_compat(
             request, deep=True, update={"conversation_id": header_conversation_id}
         )
-    request = _apply_isolated_conversation_id(request, http_request, fresh_thread)
-    session_key = None if fresh_thread else _tab_session_key(request, http_request, app_key)
+    project_conversation_key = ""
+    if not fresh_thread and not (request.thread_id or "").strip():
+        explicit_project = bool(
+            (getattr(request, "project_id", None) or "").strip()
+            or (http_request and (http_request.headers.get(_PROJECT_ID_HEADER) or "").strip())
+        )
+        if explicit_project or not (request.conversation_id or "").strip():
+            project_conversation_key = _project_conversation_key(request, http_request)
+            if project_conversation_key:
+                request = _model_copy_compat(
+                    request,
+                    deep=True,
+                    update={"conversation_id": project_conversation_key},
+                )
+    if not project_conversation_key:
+        request = _apply_isolated_conversation_id(request, http_request, fresh_thread)
+    session_key = None if fresh_thread else (
+        f"project:{_project_key()}:{project_conversation_key}"
+        if project_conversation_key
+        else _tab_session_key(request, http_request, app_key)
+    )
 
     # Track expired thread ids to delete after this request releases its tab.
     _deletion_pending: list[str] = []
@@ -2582,6 +2840,10 @@ async def _execute_chat_completion(
                     send_kwargs["read_aloud"] = bool(request.read_aloud)
                 else:
                     send_kwargs["stateless"] = True
+                if isinstance(client, ChatGPTClient):
+                    user_query_for_client = _last_user_query(prompt) or _first_user_conversation_seed(request.messages)
+                    if user_query_for_client:
+                        send_kwargs["user_query"] = user_query_for_client
                 result = await client.send_message(prompt, **send_kwargs)
             except PromptTooLongError as e:
                 log.warning("ChatGPT rejected an oversized prompt: %s", e)
@@ -2668,6 +2930,16 @@ async def _execute_chat_completion(
                                 response_text = tail
                 except Exception as e:
                     log.warning(f"Retry extraction failed: {e}")
+
+            if not response_text or not str(response_text).strip():
+                log.error("Response text is empty; treating as a gateway timeout.")
+                raise HTTPException(
+                    status_code=504,
+                    detail={
+                        "type": "gateway_timeout",
+                        "message": "The browser provider timed out or returned an empty response.",
+                    },
+                )
 
             # -- Check for tool calls ----------------------------
             tool_calls = None
@@ -2770,7 +3042,9 @@ async def _execute_chat_completion(
                         response_text = generic_final
                     else:
                         validation_errors.extend(parse_outcome.diagnostics)
-                        if (intended or tool_call_expected(request.tool_choice)) and not validation_errors:
+                        if looks_like_workspace_refusal(response_text):
+                            validation_errors.append("replied with a workspace-access refusal")
+                        elif (intended or tool_call_expected(request.tool_choice)) and not validation_errors:
                             validation_errors.append("no valid tool calls were decoded")
                 if validation_errors:
                     metrics.increment("tool_translation.repair_attempted")
@@ -2830,6 +3104,34 @@ async def _execute_chat_completion(
                                 "Gemini repair failed; keeping the original tool_calls (%s)",
                                 "; ".join(repair_errors[:6]),
                             )
+                        elif not tool_call_expected(request.tool_choice):
+                            fallback_text = (
+                                repaired_final
+                                or parse_gemini_final_response(repaired_text)
+                                or (repaired_text or "").strip()
+                                or parse_gemini_final_response(response_text)
+                                or (response_text or "").strip()
+                            )
+                            if fallback_text:
+                                log.warning(
+                                    "Tool-call translation failed after repair but tools were not required; "
+                                    "returning assistant text response to avoid client retry loop: %s",
+                                    "; ".join(repair_errors[:6]),
+                                )
+                                response_text = fallback_text
+                                tool_calls = None
+                                finish_reason = "stop"
+                            else:
+                                metrics.increment("tool_translation.repair_failed")
+                                log.error("Tool-call translation failed after repair: %s", "; ".join(repair_errors))
+                                raise HTTPException(
+                                    status_code=502,
+                                    detail={
+                                        "type": "tool_call_translation_error",
+                                        "message": "The browser provider produced an invalid tool call after one repair attempt.",
+                                        "errors": repair_errors[:12],
+                                    },
+                                )
                         else:
                             metrics.increment("tool_translation.repair_failed")
                             log.error("Tool-call translation failed after repair: %s", "; ".join(repair_errors))

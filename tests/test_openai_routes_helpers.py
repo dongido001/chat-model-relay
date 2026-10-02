@@ -85,6 +85,7 @@ from src.api.openai_routes import (
     _should_use_line_cardinality_fallback,
     _slim_gemini_browser_prompt,
     _tab_session_key,
+    _project_conversation_key,
     _validate_chat_request,
     _responses_input_to_messages,
     _responses_request_to_chat_request,
@@ -285,11 +286,13 @@ Paragraph with [a link](https://example.com)."}}]}'''
         self.assertIn("only text\ntransformation", specific)
         self.assertIn("Cursor executes", specific)
         self.assertIn("do not claim files or tools are unavailable", specific)
+        self.assertIn("Batch independent tool calls", specific)
 
     def test_tool_continuation_prompt_uses_names_not_full_schema(self) -> None:
         tools = [ToolDefinition(function=FunctionDefinition(name="Read", parameters={"type": "object", "properties": {"path": {"type": "string"}}}))]
         prompt = _build_tool_continuation_prompt(tools)
         self.assertIn("Available tool names: Read", prompt)
+        self.assertIn("Batch independent calls", prompt)
         self.assertNotIn('"properties"', prompt)
 
     def test_tool_prompt_prefixes_latest_text_user_turn_without_mutation(self) -> None:
@@ -638,6 +641,18 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertEqual(messages[0].content[0]["type"], "text")
         self.assertEqual(messages[0].content[0]["text"], "Hello")
 
+    def test_responses_function_call_output_becomes_tool_message(self) -> None:
+        messages = _responses_input_to_messages([
+            {
+                "type": "function_call_output",
+                "call_id": "call_123",
+                "output": "maximum length is 200",
+            }
+        ])
+        self.assertEqual(messages[0].role, "tool")
+        self.assertEqual(messages[0].tool_call_id, "call_123")
+        self.assertEqual(messages[0].content, "maximum length is 200")
+
     def test_responses_request_to_chat_request_basic(self) -> None:
         """ResponsesRequest translates to ChatCompletionRequest."""
         req = ResponsesRequest(
@@ -755,7 +770,8 @@ class ResponsesAPITests(unittest.TestCase):
         )
         resp = _responses_response_from_chat(chat_response, "catgpt-browser")
         self.assertEqual(len(resp.output), 2)
-        self.assertEqual(resp.output[1].type, "tool_call")
+        self.assertEqual(resp.output[1].type, "function_call")
+        self.assertEqual(resp.output[1].call_id, "call_123")
 
     def test_execute_responses_forwards_app_key_override(self) -> None:
         """Responses execution preserves app-scoped routing keys."""
@@ -789,6 +805,81 @@ class ResponsesAPITests(unittest.TestCase):
 
         self.assertEqual(captured["app_key_override"], "endpoint:n8n")
         self.assertEqual(resp.output[0].content[0].text, "ok")
+
+    def test_execute_responses_reuses_session_id_without_response_chain(self) -> None:
+        """Codex turns without a previous_response_id stay in one browser chat."""
+        captured: dict[str, str] = {}
+
+        async def fake_execute_chat_completion(
+            request: ChatCompletionRequest,
+            app_key_override: str = "",
+            http_request=None,
+            **_kwargs,
+        ) -> ChatCompletionResponse:
+            captured["conversation_id"] = request.conversation_id or ""
+            return ChatCompletionResponse(
+                model=request.model,
+                choices=[Choice(message=ChoiceMessage(role="assistant", content="ok"))],
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_chat_completion
+        openai_routes_module._execute_chat_completion = fake_execute_chat_completion
+        try:
+            req = ResponsesRequest(model="catgpt-browser", input="Hello")
+            with patch.object(openai_routes_module.Config, "API_DERIVE_CONVERSATION_ID", True):
+                asyncio.run(
+                    openai_routes_module._execute_responses(
+                        req,
+                        http_request=_make_request({"x-session-id": "codex-chat-42"}),
+                    )
+                )
+        finally:
+            openai_routes_module._execute_chat_completion = original
+
+        self.assertEqual(captured["conversation_id"], "codex-chat-42")
+
+    def test_execute_responses_keeps_browser_route_when_store_is_false(self) -> None:
+        """store=false skips response storage but retains the browser chat mapping."""
+        route = types.SimpleNamespace(
+            project_key="project",
+            app_key="app",
+            conversation_key="conversation",
+        )
+        deleted: list[object] = []
+
+        class Store:
+            def delete_route(self, *_args) -> None:
+                deleted.append(True)
+
+        async def fake_execute_chat_completion(
+            request: ChatCompletionRequest,
+            app_key_override: str = "",
+            http_request=None,
+            **_kwargs,
+        ) -> ChatCompletionResponse:
+            return ChatCompletionResponse(
+                id="chatcmpl-route",
+                model=request.model,
+                choices=[Choice(message=ChoiceMessage(role="assistant", content="ok"))],
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_chat_completion
+        openai_routes_module._execute_chat_completion = fake_execute_chat_completion
+        openai_routes_module._completion_route_outcomes["chatcmpl-route"] = route
+        try:
+            with patch.object(openai_routes_module, "_get_conversation_store", return_value=Store()):
+                asyncio.run(
+                    openai_routes_module._execute_responses(
+                        ResponsesRequest(model="catgpt-browser", input="Hello", store=False)
+                    )
+                )
+        finally:
+            openai_routes_module._execute_chat_completion = original
+            openai_routes_module._completion_route_outcomes.pop("chatcmpl-route", None)
+
+        self.assertEqual(deleted, [])
 
     def test_execute_chat_streaming_uses_non_stream_browser_call(self) -> None:
         """Chat stream requests execute the browser call without stream=true."""
@@ -910,6 +1001,40 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertFalse(captured["stream"])
         self.assertEqual(resp.output[0].content[0].text, "ok")
 
+    def test_stream_responses_emits_responses_item_lifecycle(self) -> None:
+        """Responses streams include the item events Codex needs to render text."""
+        async def fake_execute_chat_completion(
+            request: ChatCompletionRequest,
+            app_key_override: str = "",
+            http_request=None,
+            **_kwargs,
+        ) -> ChatCompletionResponse:
+            return ChatCompletionResponse(
+                model=request.model,
+                choices=[Choice(message=ChoiceMessage(role="assistant", content="ok"))],
+                usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+
+        original = openai_routes_module._execute_chat_completion
+        openai_routes_module._execute_chat_completion = fake_execute_chat_completion
+        try:
+            async def _run_stream_test() -> bytes:
+                stream_response = await openai_routes_module._stream_responses(
+                    ResponsesRequest(model="catgpt-browser", input="Hello", stream=True)
+                )
+                return b"".join(await _collect_stream(stream_response))
+
+            body = asyncio.run(_run_stream_test())
+        finally:
+            openai_routes_module._execute_chat_completion = original
+
+        self.assertIn(b"event: response.created", body)
+        self.assertIn(b"event: response.output_item.added", body)
+        self.assertIn(b"event: response.content_part.added", body)
+        self.assertIn(b"event: response.output_text.delta", body)
+        self.assertIn(b"event: response.output_item.done", body)
+        self.assertIn(b"event: response.completed", body)
+
     def test_validate_responses_request_rejects_empty_input(self) -> None:
         """Empty input raises HTTPException."""
         req = ResponsesRequest(model="catgpt-browser", input="")
@@ -1022,6 +1147,51 @@ class ResponsesAPITests(unittest.TestCase):
         req = ChatCompletionRequest(messages=[ChatMessage(role="user", content="hello")])
         self.assertEqual(_tab_session_key(req, None, app_key="endpoint:mealie"), "app:endpoint:mealie")
 
+    def test_project_conversation_key_uses_explicit_project_id(self) -> None:
+        req = ChatCompletionRequest(
+            messages=[ChatMessage(role="user", content="hello")], project_id="cutline"
+        )
+        first = _project_conversation_key(req, None)
+        second = _project_conversation_key(
+            ChatCompletionRequest(messages=[ChatMessage(role="user", content="another chat")]),
+            _make_request({"x-catgpt-project-id": "cutline"}),
+        )
+        self.assertEqual(first, second)
+        self.assertTrue(first.startswith("project:"))
+
+    def test_project_conversation_key_infers_workspace_workdir(self) -> None:
+        req = ChatCompletionRequest(messages=[ChatMessage(
+            role="user",
+            content='Please inspect this request: {"workdir":"/Users/gideon/Projects/cutline"}',
+        )])
+        same_project = ChatCompletionRequest(messages=[ChatMessage(
+            role="user",
+            content='{"cwd":"/Users/gideon/Projects/cutline"}',
+        )])
+        tool_context = ChatCompletionRequest(messages=[ChatMessage(
+            role="assistant",
+            tool_calls=[ToolCall(function=FunctionCallInfo(
+                name="exec_command",
+                arguments='{"cmd":"ls","workdir":"/Users/gideon/Projects/cutline"}',
+            ))],
+        )])
+        other_project = ChatCompletionRequest(messages=[ChatMessage(
+            role="user",
+            content='{"workdir":"/Users/gideon/Projects/other"}',
+        )])
+        self.assertEqual(
+            _project_conversation_key(req, None),
+            _project_conversation_key(same_project, None),
+        )
+        self.assertEqual(
+            _project_conversation_key(req, None),
+            _project_conversation_key(tool_context, None),
+        )
+        self.assertNotEqual(
+            _project_conversation_key(req, None),
+            _project_conversation_key(other_project, None),
+        )
+
     def test_isolated_conversation_id_hashes_first_cursor_query(self) -> None:
         first = ChatMessage(
             role="user",
@@ -1073,6 +1243,26 @@ class ResponsesAPITests(unittest.TestCase):
         with patch.object(openai_routes_module.Config, "API_DERIVE_CONVERSATION_ID", False):
             isolated = _apply_isolated_conversation_id(req, None, False)
         self.assertFalse(isolated.conversation_id)
+
+    def test_isolated_conversation_id_stable_across_tool_turns(self) -> None:
+        # Turn 1: user asks a question
+        turn1 = ChatMessage(role="user", content="what is in pyproject.toml")
+        req1 = ChatCompletionRequest(messages=[turn1])
+        isolated1 = _apply_isolated_conversation_id(req1, None, False)
+        self.assertTrue(isolated1.conversation_id.startswith("derived:"))
+
+        # Turn 2: tool executed, returning cwd and workdir in messages
+        turn2_tool = ChatMessage(
+            role="assistant",
+            tool_calls=[ToolCall(function=FunctionCallInfo(
+                name="exec_cmd",
+                arguments='{"cmd":"cat pyproject.toml","workdir":"/Users/gideon/Projects/myrepo"}',
+            ))],
+        )
+        req2 = ChatCompletionRequest(messages=[turn1, turn2_tool])
+        isolated2 = _apply_isolated_conversation_id(req2, None, False)
+        # Conversation ID must remain identical on Turn 2
+        self.assertEqual(isolated1.conversation_id, isolated2.conversation_id)
 
     def test_anthropic_messages_to_chat_request(self) -> None:
         body = {

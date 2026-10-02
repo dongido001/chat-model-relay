@@ -162,6 +162,65 @@ class ConversationRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(routing.action, "new-chat-history-diverged")
         self.assertGreaterEqual(client.new_chat_calls, 1)
 
+    async def test_project_thread_rotates_at_size_limit_with_bounded_context(self) -> None:
+        client = _RoutingClient("thread-old")
+        request = ChatCompletionRequest(messages=[ChatMessage(role="user", content="new task")])
+        initial = await openai_routes._prepare_conversation_routing(
+            client, request, app_key="app", conversation_key="project:cutline"
+        )
+        new_chat_before = client.new_chat_calls
+        prior = [
+            {"role": "user", "content": "earlier request"},
+            {"role": "assistant", "content": "useful project context"},
+        ]
+        openai_routes._get_conversation_store().save_route(
+            project_key=initial.project_key, app_key=initial.app_key,
+            conversation_key=initial.conversation_key, thread_id="thread-old",
+            transcript=prior, message_hashes=[openai_routes._message_hash(item) for item in prior],
+            contract_hash=initial.contract_hash,
+        )
+        with (
+            patch.object(openai_routes.Config, "API_PROJECT_THREAD_MAX_CHARS", 1),
+            patch.object(openai_routes.Config, "API_PROJECT_THREAD_CONTEXT_CHARS", 1000),
+        ):
+            routing = await openai_routes._prepare_conversation_routing(
+                client, request, app_key="app", conversation_key="project:cutline"
+            )
+        self.assertEqual(routing.action, "project-thread-size-rotation")
+        self.assertIsNone(routing.previous_route)
+        self.assertEqual(client.new_chat_calls, new_chat_before + 1)
+        contents = [message.content for message in routing.messages_for_browser]
+        self.assertIn("useful project context", contents)
+        self.assertEqual(contents[-1], "new task")
+
+    async def test_project_thread_is_shared_across_client_apps(self) -> None:
+        project_key = "project:cutline"
+        request = ChatCompletionRequest(messages=[ChatMessage(role="user", content="first task")])
+        first_client = _RoutingClient("thread-project")
+        initial = await openai_routes._prepare_conversation_routing(
+            first_client, request, app_key="codex", conversation_key=project_key
+        )
+        transcript = [
+            {"role": "user", "content": "first task"},
+            {"role": "assistant", "content": "first answer"},
+        ]
+        openai_routes._get_conversation_store().save_route(
+            project_key=initial.project_key, app_key=initial.app_key,
+            conversation_key=initial.conversation_key, thread_id="thread-project",
+            transcript=transcript, message_hashes=[openai_routes._message_hash(item) for item in transcript],
+            contract_hash=initial.contract_hash,
+        )
+
+        second_client = _RoutingClient("thread-project")
+        follow_up = ChatCompletionRequest(messages=[ChatMessage(role="user", content="second task")])
+        routing = await openai_routes._prepare_conversation_routing(
+            second_client, follow_up, app_key="githubcopilotchat", conversation_key=project_key
+        )
+        self.assertIsNotNone(routing.previous_route)
+        self.assertEqual(routing.previous_route.thread_id, "thread-project")
+        self.assertEqual(routing.messages_for_browser[0].content, "second task")
+        self.assertEqual(second_client.new_chat_calls, 0)
+
     async def test_derived_copilot_replay_reuses_thread(self) -> None:
         client = _RoutingClient("thread-1")
         request = ChatCompletionRequest(messages=[ChatMessage(role="user", content="old")])
@@ -188,6 +247,75 @@ class ConversationRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(routing.action, "derived-replay-delta")
         self.assertEqual([message.content for message in routing.messages_for_browser], ["hello"])
+        self.assertEqual(client.new_chat_calls, new_chat_before)
+        self.assertEqual(client.navigate_calls[-1], "thread-1")
+
+    async def test_contract_change_reuses_explicit_conversation_thread(self) -> None:
+        """Changing Codex tool metadata must not reset its browser conversation."""
+        client = _RoutingClient("thread-1")
+        initial_request = ChatCompletionRequest(
+            messages=[ChatMessage(role="system", content="old contract"), ChatMessage(role="user", content="one")]
+        )
+        initial = await openai_routes._prepare_conversation_routing(
+            client, initial_request, app_key="app", conversation_key="codex-session"
+        )
+        transcript = [*initial.transcript_input, {"role": "assistant", "content": "answer"}]
+        openai_routes._get_conversation_store().save_route(
+            project_key=initial.project_key, app_key=initial.app_key,
+            conversation_key=initial.conversation_key, thread_id="thread-1",
+            transcript=transcript,
+            message_hashes=[openai_routes._message_hash(item) for item in transcript],
+            contract_hash=initial.contract_hash,
+        )
+        new_chat_before = client.new_chat_calls
+        changed = ChatCompletionRequest(messages=[
+            ChatMessage(role="system", content="new contract"),
+            ChatMessage(role="user", content="two"),
+        ])
+
+        routing = await openai_routes._prepare_conversation_routing(
+            client, changed, app_key="app", conversation_key="codex-session"
+        )
+
+        self.assertEqual(routing.action, "contract-change-delta")
+        self.assertEqual([message.content for message in routing.messages_for_browser], ["two"])
+        self.assertEqual(client.new_chat_calls, new_chat_before)
+        self.assertEqual(client.navigate_calls[-1], "thread-1")
+
+    async def test_derived_replay_retains_question_image_and_editor_context(self) -> None:
+        client = _RoutingClient("thread-1")
+        request = ChatCompletionRequest(messages=[ChatMessage(role="user", content="old")])
+        initial = await openai_routes._prepare_conversation_routing(
+            client, request, app_key="app", conversation_key="derived:abc123"
+        )
+        transcript = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "answer"}]
+        openai_routes._get_conversation_store().save_route(
+            project_key=initial.project_key, app_key=initial.app_key,
+            conversation_key=initial.conversation_key, thread_id="thread-1",
+            transcript=transcript,
+            message_hashes=[openai_routes._message_hash(item) for item in transcript],
+            contract_hash=initial.contract_hash,
+        )
+        new_chat_before = client.new_chat_calls
+        replay = ChatCompletionRequest(messages=[
+            ChatMessage(role="system", content="huge contract"),
+            ChatMessage(role="user", content="old dump"),
+            ChatMessage(role="assistant", content="tool json"),
+            ChatMessage(role="user", content="This queued shot has no indication after refresh"),
+            ChatMessage(role="user", content=[{"type": "image_url", "image_url": {"url": "data:image/png;base64,c2NyZWVu"}}]),
+            ChatMessage(role="user", content='<attachment name="Browser Pages">Cutline Studio</attachment>'),
+        ])
+        routing = await openai_routes._prepare_conversation_routing(
+            client, replay, app_key="app", conversation_key="derived:abc123"
+        )
+        self.assertEqual(routing.action, "derived-replay-delta")
+        self.assertEqual(routing.messages_for_browser, replay.messages[-3:])
+        from src.api.prompt_compaction import _new_attachments_from_latest_user, _latest_turn_messages
+        pruned = _latest_turn_messages(routing.messages_for_browser, include_system=False)
+        self.assertEqual(pruned, replay.messages[-3:])
+        urls, _ = _new_attachments_from_latest_user(pruned)
+        self.assertEqual(urls, ["data:image/png;base64,c2NyZWVu"])
+        self.assertEqual(routing.transcript_input[-3]["content"], "This queued shot has no indication after refresh")
         self.assertEqual(client.new_chat_calls, new_chat_before)
         self.assertEqual(client.navigate_calls[-1], "thread-1")
 

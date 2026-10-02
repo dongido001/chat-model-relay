@@ -344,6 +344,207 @@ class GeminiLongPromptTests(IsolatedAsyncioTestCase):
         self.assertNotIn("x" * 100, typed[0])
 
 
+class ClearBusyGenerationTests(IsolatedAsyncioTestCase):
+    async def test_clear_busy_generation_noop_without_stop(self) -> None:
+        client = ChatGPTClient(_FakePage())  # type: ignore[arg-type]
+        client._composer_state = AsyncMock(
+            return_value={
+                "hasStopButton": False,
+                "sendButton": {"disabled": False, "visible": True},
+            }
+        )
+        client.interrupt_generation = AsyncMock()  # type: ignore[method-assign]
+
+        cleared = await client._clear_busy_generation()
+
+        self.assertFalse(cleared)
+        client.interrupt_generation.assert_not_awaited()
+
+    async def test_clear_busy_generation_interrupts_and_waits_for_send(self) -> None:
+        client = ChatGPTClient(_FakePage())  # type: ignore[arg-type]
+        states = [
+            {
+                "hasStopButton": True,
+                "sendButton": {"disabled": True, "ariaDisabled": "true", "visible": True},
+            },
+            {
+                "hasStopButton": True,
+                "sendButton": {"disabled": True, "ariaDisabled": "true", "visible": True},
+            },
+            {
+                "hasStopButton": False,
+                "sendButton": {"disabled": False, "ariaDisabled": "false", "visible": True},
+            },
+        ]
+        client._composer_state = AsyncMock(side_effect=states)
+        client.interrupt_generation = AsyncMock()  # type: ignore[method-assign]
+
+        with patch("src.chatgpt.client.asyncio.sleep", new=AsyncMock()):
+            cleared = await client._clear_busy_generation(timeout_s=5)
+
+        self.assertTrue(cleared)
+        client.interrupt_generation.assert_awaited()
+
+    async def test_wait_for_send_ready_interrupts_active_generation(self) -> None:
+        client = ChatGPTClient(_FakePage())  # type: ignore[arg-type]
+        states = [
+            {
+                "hasStopButton": True,
+                "sendButton": {"disabled": True, "ariaDisabled": "true", "visible": True},
+                "composerText": "queued",
+                "validationText": "",
+            },
+            {
+                "hasStopButton": False,
+                "sendButton": {"disabled": False, "ariaDisabled": "false", "visible": True},
+                "composerText": "queued",
+                "validationText": "",
+            },
+        ]
+        client._composer_state = AsyncMock(side_effect=states)
+        client.interrupt_generation = AsyncMock()  # type: ignore[method-assign]
+
+        with patch("src.chatgpt.client.asyncio.sleep", new=AsyncMock()):
+            ready = await client._wait_for_send_ready(timeout_s=5)
+
+        self.assertEqual(ready, "ready")
+        client.interrupt_generation.assert_awaited_once()
+
+    async def test_send_retries_after_clearing_busy_generation(self) -> None:
+        client = _FlowClient(_FakePage(), prompt_state="ready")
+        clicks = iter(["disabled", "clicked"])
+
+        async def click_send() -> str:
+            return next(clicks)
+
+        client._click_send = click_send  # type: ignore[method-assign]
+        client._clear_busy_generation = AsyncMock(side_effect=[False, True])  # type: ignore[method-assign]
+        client._wait_for_send_ready = AsyncMock(return_value="ready")  # type: ignore[method-assign]
+        typed: list[str] = []
+
+        async def record_type(_page, _selector, text: str) -> None:
+            typed.append(text)
+
+        with (
+            patch("src.chatgpt.client.human_type", new=record_type),
+            patch("src.chatgpt.client.random_delay", new=AsyncMock()),
+            patch("src.chatgpt.client.count_assistant_messages", new=AsyncMock(return_value=0)),
+            patch("src.chatgpt.client.get_latest_assistant_turn_signature", new=AsyncMock(return_value=None)),
+            patch("src.chatgpt.client.get_latest_user_turn_signature", new=AsyncMock(return_value=None)),
+            patch("src.chatgpt.client.wait_for_response_complete", new=AsyncMock(return_value=True)),
+            patch("src.chatgpt.client.extract_images_from_response", new=AsyncMock(return_value=[])),
+            patch("src.chatgpt.client.extract_last_response_via_copy", new=AsyncMock(return_value="RETRY_OK")),
+            patch("src.chatgpt.client.asyncio.sleep", new=AsyncMock()),
+        ):
+            result = await client.send_message("hello")
+
+        self.assertEqual(result.message, "RETRY_OK")
+        self.assertEqual(client._clear_busy_generation.await_count, 2)
+
+
+
+    def test_extract_user_query_variants(self) -> None:
+        tag_prompt = "[System instruction: rule]\n\n<user_query>implement login</user_query>"
+        self.assertEqual(ChatGPTClient._extract_user_query(tag_prompt), "implement login")
+
+        vscode_prompt = "system context\n<userRequest>fix css styling</userRequest>"
+        self.assertEqual(ChatGPTClient._extract_user_query(vscode_prompt), "fix css styling")
+
+        sys_prompt = "[System instructions]\n1. rule 1\n2. rule 2\n\nUser: how do I write a test?"
+        self.assertEqual(ChatGPTClient._extract_user_query(sys_prompt), "how do I write a test?")
+
+        plain_sys = "[System instruction: be concise]\n\nExplain recursion"
+        self.assertEqual(ChatGPTClient._extract_user_query(plain_sys), "Explain recursion")
+
+        huge_non_tagged = "héllo\n" + ("x" * 5000)
+        self.assertEqual(ChatGPTClient._extract_user_query(huge_non_tagged), "")
+
+    async def test_prompt_attachment_surfaces_extracted_user_query(self) -> None:
+        client = _FlowClient(_FakePage())
+        typed: list[str] = []
+
+        async def record_type(_page, _selector, text: str) -> None:
+            typed.append(text)
+
+        long_prompt = (
+            "[System instructions]\n" + ("rule\n" * 1000) +
+            "\n\n<user_query>build a python CLI</user_query>"
+        )
+
+        with (
+            patch.object(Config, "CHATGPT_LONG_PROMPT_FALLBACK", "attachment"),
+            patch.object(Config, "CHATGPT_LONG_PROMPT_THRESHOLD", 80),
+            patch("src.chatgpt.client.human_type", new=record_type),
+            patch("src.chatgpt.client.random_delay", new=AsyncMock()),
+            patch("src.chatgpt.client.count_assistant_messages", new=AsyncMock(return_value=0)),
+            patch("src.chatgpt.client.get_latest_assistant_turn_signature", new=AsyncMock(return_value=None)),
+            patch("src.chatgpt.client.get_latest_user_turn_signature", new=AsyncMock(return_value=None)),
+            patch("src.chatgpt.client.wait_for_response_complete", new=AsyncMock(return_value=True)),
+            patch("src.chatgpt.client.extract_images_from_response", new=AsyncMock(return_value=[])),
+            patch("src.chatgpt.client.extract_last_response_via_copy", new=AsyncMock(return_value="OK")),
+            patch("src.chatgpt.client.asyncio.sleep", new=AsyncMock()),
+        ):
+            result = await client.send_message(long_prompt)
+
+        self.assertEqual(result.message, "OK")
+        self.assertGreaterEqual(len(typed), 1)
+        composer_submission = typed[-1]
+        self.assertTrue(composer_submission.startswith("build a python CLI\n\nRead the attached file"))
+        self.assertIn("answer immediately without summarizing or acknowledging the attachment", composer_submission)
+
+    async def test_prompt_attachment_with_tools_adds_anti_preamble_guard(self) -> None:
+        client = _FlowClient(_FakePage())
+        typed: list[str] = []
+
+        async def record_type(_page, _selector, text: str) -> None:
+            typed.append(text)
+
+        tool_prompt = (
+            "[System instructions]\n"
+            "You are in tool-calling mode.\n" +
+            ("schema\n" * 1000) +
+            "\n\n<user_query>read data.json</user_query>"
+        )
+
+        with (
+            patch.object(Config, "CHATGPT_LONG_PROMPT_FALLBACK", "attachment"),
+            patch.object(Config, "CHATGPT_LONG_PROMPT_THRESHOLD", 80),
+            patch("src.chatgpt.client.human_type", new=record_type),
+            patch("src.chatgpt.client.random_delay", new=AsyncMock()),
+            patch("src.chatgpt.client.count_assistant_messages", new=AsyncMock(return_value=0)),
+            patch("src.chatgpt.client.get_latest_assistant_turn_signature", new=AsyncMock(return_value=None)),
+            patch("src.chatgpt.client.get_latest_user_turn_signature", new=AsyncMock(return_value=None)),
+            patch("src.chatgpt.client.wait_for_response_complete", new=AsyncMock(return_value=True)),
+            patch("src.chatgpt.client.extract_images_from_response", new=AsyncMock(return_value=[])),
+            patch("src.chatgpt.client.extract_last_response_via_copy", new=AsyncMock(return_value="OK")),
+            patch("src.chatgpt.client.asyncio.sleep", new=AsyncMock()),
+        ):
+            await client.send_message(tool_prompt)
+
+        self.assertGreaterEqual(len(typed), 1)
+        composer_submission = typed[-1]
+        self.assertIn("output only the JSON code block without conversational commentary", composer_submission)
+
 if __name__ == "__main__":
     unittest.main()
 
+def test_tool_prompt_attachment_fallback_tells_model_to_return_tool_calls():
+    prompt = (
+        "<user_query>fix the bug in the workspace</user_query>\n"
+        "You are in tool-calling mode.\n"
+        "Available functions: read_file, edit_file.\n"
+        "Return a tool_calls JSON object when workspace changes are needed.\n"
+    )
+
+    submitted = ChatGPTClient._attachment_fallback_composer_prompt(
+        "catgpt-long-prompt-test.txt",
+        prompt,
+        "fix the bug in the workspace",
+    )
+
+    assert "You DO have workspace access through the editor client" in submitted
+    assert "the client will execute any `tool_calls` JSON you return" in submitted
+    assert "Do not refuse due to missing local/editor tools" in submitted
+    assert '"tool_calls"' in submitted
+    assert "read_file, edit_file" in submitted
+    assert "output only the JSON code block without conversational commentary" in submitted

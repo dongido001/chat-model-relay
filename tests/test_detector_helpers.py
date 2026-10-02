@@ -194,6 +194,32 @@ class DetectorCopyButtonTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(snapshot["latestAssistant"]["hasCopyButton"])
         await context.close()
 
+    async def test_assistant_markdown_root_is_detected_without_legacy_role_attributes(self) -> None:
+        context = await self.browser.new_context()
+        page = await context.new_page()
+        await page.set_content(
+            """
+            <!doctype html>
+            <main>
+              <div class="group/user-message">
+                <div class="MarkdownRoot-user" data-markdown-text-tone="user-message">
+                  User prompt
+                </div>
+              </div>
+              <div class="MarkdownRoot-assistant">
+                <p>Assistant final answer</p>
+              </div>
+            </main>
+            """
+        )
+
+        snapshot = await _conversation_snapshot(page)
+
+        self.assertEqual(snapshot["assistantCount"], 1)
+        self.assertEqual(snapshot["userCount"], 1)
+        self.assertIn("Assistant final answer", snapshot["latestAssistant"]["text"])
+        await context.close()
+
 
 if __name__ == "__main__":
     unittest.main()

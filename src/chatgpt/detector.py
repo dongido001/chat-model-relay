@@ -68,8 +68,19 @@ _CONVERSATION_SNAPSHOT_JS = (
             el.getAttribute("data-testid") || "",
             textOf(el).slice(0, 80)
         ].join(" ").toLowerCase();
-        return Boolean(el.closest("pre, code, .code-block, [data-testid*='code' i]")) ||
-            label.includes("copy code");
+        if (label.includes("copy code")) return true;
+        if (Boolean(el.closest("pre, code, .code-block, [data-testid*='code' i], [class*='code-block' i], [class*='codeblock' i]"))) return true;
+        let p = el.parentElement;
+        for (let i = 0; i < 4 && p && p !== document.body; i++) {
+            if (p.matches && p.matches("article, [data-turn-key], [data-message-author-role], .MarkdownRoot, [class*='MarkdownRoot'], [data-testid*='conversation-turn']")) {
+                break;
+            }
+            if (p.querySelector && p.querySelector("pre, code")) {
+                return true;
+            }
+            p = p.parentElement;
+        }
+        return false;
     };
     const isTableCopyButton = (el) => {
         if (!el) return false;
@@ -78,19 +89,54 @@ _CONVERSATION_SNAPSHOT_JS = (
             el.getAttribute("data-testid") || "",
             textOf(el).slice(0, 80)
         ].join(" ").toLowerCase();
-        return Boolean(el.closest("._tableContainer, ._tableWrapper, table")) ||
-            label.includes("copy table");
+        if (label.includes("copy table")) return true;
+        if (Boolean(el.closest("._tableContainer, ._tableWrapper, table, [class*='table' i]"))) return true;
+        let p = el.parentElement;
+        for (let i = 0; i < 4 && p && p !== document.body; i++) {
+            if (p.matches && p.matches("article, [data-turn-key], [data-message-author-role], .MarkdownRoot, [class*='MarkdownRoot'], [data-testid*='conversation-turn']")) {
+                break;
+            }
+            if (p.querySelector && p.querySelector("table")) {
+                return true;
+            }
+            p = p.parentElement;
+        }
+        return false;
     };
-    const isTurnCopyButton = (el) => !isCodeCopyButton(el) && !isTableCopyButton(el);
+    const isTurnActionBar = (el) => {
+        if (!el) return false;
+        if (el.closest(".turn-action-controls, [class*='turn-action'], [data-testid*='turn-action']")) return true;
+        const container = el.parentElement;
+        if (container && container.querySelector("button[aria-label*='good' i], button[aria-label*='bad' i], button[aria-label*='read' i], button[aria-label*='listen' i], button[aria-label*='thumb' i], button[aria-label*='share' i]")) {
+            return true;
+        }
+        return false;
+    };
+    const isTurnCopyButton = (el) => {
+        if (isTurnActionBar(el)) return true;
+        return !isCodeCopyButton(el) && !isTableCopyButton(el);
+    };
 
     const findTurnCopyButton = (root) => {
-        for (const selector of copySelectors) {
-            const matches = Array.from(root.querySelectorAll(selector))
-                .filter(isTurnCopyButton);
-            const visible = matches.find(isVisible);
-            if (visible) return visible;
-            if (matches.length) return matches[matches.length - 1];
+        const actionContainer = root.querySelector(".turn-action-controls, [class*='turn-action'], [data-testid*='turn-action']");
+        if (actionContainer) {
+            for (const selector of copySelectors) {
+                const btn = actionContainer.querySelector(selector);
+                if (btn && isVisible(btn)) return btn;
+            }
         }
+        const candidates = [];
+        for (const selector of copySelectors) {
+            const matches = Array.from(root.querySelectorAll(selector)).filter(isTurnCopyButton);
+            for (const m of matches) {
+                if (!candidates.includes(m)) candidates.push(m);
+            }
+        }
+        const actionBtn = candidates.find((c) => isTurnActionBar(c) && isVisible(c));
+        if (actionBtn) return actionBtn;
+        const visible = candidates.filter(isVisible);
+        if (visible.length) return visible[visible.length - 1];
+        if (candidates.length) return candidates[candidates.length - 1];
         return null;
     };
 
@@ -130,24 +176,46 @@ _CONVERSATION_SNAPSHOT_JS = (
         if (ownRole === "assistant" || ownRole === "user") return ownRole;
         const roleEl = root.querySelector('[data-message-author-role="assistant"], [data-message-author-role="user"]');
         if (roleEl) return roleEl.getAttribute("data-message-author-role") || "";
-        if (root.matches(".agent-turn") || root.querySelector(".agent-turn") || hasGeneratedImage(root)) return "assistant";
+
+        if (
+            root.matches('[data-user-message-bubble], [data-markdown-text-tone="user-message"], .rich-text-user-turn, [data-chatgpt-search-unit-key*="user"], [data-content-search-turn-key*="user"], [class*="group/user-message"]') ||
+            root.querySelector('[data-user-message-bubble], [data-markdown-text-tone="user-message"], .rich-text-user-turn, [data-chatgpt-search-unit-key*="user"], [data-content-search-turn-key*="user"], [class*="group/user-message"]')
+        ) {
+            return "user";
+        }
+
+        if (
+            root.matches(".agent-turn, [data-chatgpt-search-unit-key*='assistant'], [data-content-search-unit-key*='assistant']") ||
+            root.querySelector(".agent-turn, [data-chatgpt-search-unit-key*='assistant'], [data-content-search-unit-key*='assistant']") ||
+            hasGeneratedImage(root) ||
+            Boolean(findTurnCopyButton(root)) ||
+            root.matches(".turn-action-controls") ||
+            root.querySelector(".turn-action-controls") ||
+            root.matches('[class*="MarkdownRoot"]:not([data-markdown-text-tone="user-message"])') ||
+            root.querySelector('[class*="MarkdownRoot"]:not([data-markdown-text-tone="user-message"])') ||
+            root.querySelector(".markdown, .prose")
+        ) {
+            return "assistant";
+        }
+
         const label = [
             root.getAttribute("aria-label") || "",
             root.getAttribute("data-testid") || "",
-            textOf(root).slice(0, 80)
+            textOf(root.querySelector("h4.sr-only, h5.sr-only, h6.sr-only")),
+            textOf(root).slice(0, 100)
         ].join(" ").toLowerCase();
-        if (label.includes("chatgpt said")) return "assistant";
         if (label.includes("you said")) return "user";
+        if (label.includes("chatgpt said") || label.includes("chatgpt")) return "assistant";
         return "";
     };
 
     const stableIdOf = (root) => {
-        const attrs = ["data-message-id", "data-turn-id", "data-testid", "data-testid-message-id", "id"];
+        const attrs = ["data-turn-key", "data-content-search-turn-key", "data-chatgpt-search-unit-key", "data-message-id", "data-turn-id", "data-testid", "data-testid-message-id", "id"];
         for (const attr of attrs) {
             const value = root.getAttribute(attr);
             if (value) return value;
         }
-        const child = root.querySelector("[data-message-id], [data-turn-id], [data-testid-message-id]");
+        const child = root.querySelector("[data-turn-key], [data-content-search-turn-key], [data-chatgpt-search-unit-key], [data-message-id], [data-turn-id], [data-testid-message-id]");
         if (child) {
             for (const attr of attrs) {
                 const value = child.getAttribute(attr);
@@ -162,12 +230,18 @@ _CONVERSATION_SNAPSHOT_JS = (
             '[data-message-author-role="assistant"] .markdown',
             '[data-message-author-role="assistant"] .prose',
             '[data-message-author-role="assistant"]',
+            '[class*="MarkdownRoot"]:not([data-markdown-text-tone="user-message"])',
             ".markdown",
             ".prose",
             "[data-start]",
+            ".whitespace-pre-wrap",
         ] : [
+            '[data-user-message-bubble]',
+            '[data-markdown-text-tone="user-message"]',
+            ".rich-text-user-turn",
             '[data-message-author-role="user"]',
             '[data-testid*="user" i]',
+            ".whitespace-pre-wrap",
         ];
         const parts = [];
         if (role && root.matches(`[data-message-author-role="${role}"]`)) {
@@ -196,13 +270,19 @@ _CONVERSATION_SNAPSHOT_JS = (
             'section[data-testid^="conversation-turn-"]',
             'div[data-testid^="conversation-turn-"]',
             'section[data-turn]',
-            'div[data-turn]'
+            'div[data-turn]',
+            '[data-turn-key]',
+            '[data-content-search-turn-key]',
+            '[data-chatgpt-search-unit-key]',
+            '[data-user-message-bubble]',
+            'div[class*="group/conversation-turn"]',
+            'div[class*="group/user-message"]'
         ].join(",")) || el;
         rootSet.add(promoted);
     };
 
     const selectors = """
-    + _selector_list_js(list(Selectors.ASSISTANT_MESSAGE) + ["article", 'section[data-testid^="conversation-turn-"]', 'div[data-testid^="conversation-turn-"]', '[data-testid*="conversation-turn" i]', 'section[data-turn]', 'div[data-turn]', '[data-message-author-role="assistant"]', '[data-message-author-role="user"]', ".agent-turn", 'div[class*="group/conversation-turn"]'])
+    + _selector_list_js(list(Selectors.ASSISTANT_MESSAGE) + ["article", 'section[data-testid^="conversation-turn-"]', 'div[data-testid^="conversation-turn-"]', '[data-testid*="conversation-turn" i]', 'section[data-turn]', 'div[data-turn]', '[data-message-author-role="assistant"]', '[data-message-author-role="user"]', ".agent-turn", 'div[class*="group/conversation-turn"]', '[data-turn-key]', '[data-content-search-turn-key]', '[data-chatgpt-search-unit-key]', '[data-user-message-bubble]', '[data-markdown-text-tone]', '[class*="MarkdownRoot"]', '.turn-action-controls', '.rich-text-user-turn', 'button[data-testid*="copy-turn" i]', "button[aria-label*='Copy' i]"])
     + r""";
 
     for (const selector of selectors) {
@@ -332,8 +412,19 @@ _CLICK_LATEST_COPY_BUTTON_JS = (
             el.getAttribute("data-testid") || "",
             textOf(el).slice(0, 80)
         ].join(" ").toLowerCase();
-        return Boolean(el.closest("pre, code, .code-block, [data-testid*='code' i]")) ||
-            label.includes("copy code");
+        if (label.includes("copy code")) return true;
+        if (Boolean(el.closest("pre, code, .code-block, [data-testid*='code' i], [class*='code-block' i], [class*='codeblock' i]"))) return true;
+        let p = el.parentElement;
+        for (let i = 0; i < 4 && p && p !== document.body; i++) {
+            if (p.matches && p.matches("article, [data-turn-key], [data-message-author-role], .MarkdownRoot, [class*='MarkdownRoot'], [data-testid*='conversation-turn']")) {
+                break;
+            }
+            if (p.querySelector && p.querySelector("pre, code")) {
+                return true;
+            }
+            p = p.parentElement;
+        }
+        return false;
     };
     const isTableCopyButton = (el) => {
         if (!el) return false;
@@ -342,18 +433,54 @@ _CLICK_LATEST_COPY_BUTTON_JS = (
             el.getAttribute("data-testid") || "",
             textOf(el).slice(0, 80)
         ].join(" ").toLowerCase();
-        return Boolean(el.closest("._tableContainer, ._tableWrapper, table")) ||
-            label.includes("copy table");
-    };
-    const isTurnCopyButton = (el) => !isCodeCopyButton(el) && !isTableCopyButton(el);
-    const findTurnCopyButton = (root) => {
-        for (const selector of copySelectors) {
-            const matches = Array.from(root.querySelectorAll(selector))
-                .filter(isTurnCopyButton);
-            const visible = matches.find(isVisible);
-            if (visible) return visible;
-            if (matches.length) return matches[matches.length - 1];
+        if (label.includes("copy table")) return true;
+        if (Boolean(el.closest("._tableContainer, ._tableWrapper, table, [class*='table' i]"))) return true;
+        let p = el.parentElement;
+        for (let i = 0; i < 4 && p && p !== document.body; i++) {
+            if (p.matches && p.matches("article, [data-turn-key], [data-message-author-role], .MarkdownRoot, [class*='MarkdownRoot'], [data-testid*='conversation-turn']")) {
+                break;
+            }
+            if (p.querySelector && p.querySelector("table")) {
+                return true;
+            }
+            p = p.parentElement;
         }
+        return false;
+    };
+    const isTurnActionBar = (el) => {
+        if (!el) return false;
+        if (el.closest(".turn-action-controls, [class*='turn-action'], [data-testid*='turn-action']")) return true;
+        const container = el.parentElement;
+        if (container && container.querySelector("button[aria-label*='good' i], button[aria-label*='bad' i], button[aria-label*='read' i], button[aria-label*='listen' i], button[aria-label*='thumb' i], button[aria-label*='share' i]")) {
+            return true;
+        }
+        return false;
+    };
+    const isTurnCopyButton = (el) => {
+        if (isTurnActionBar(el)) return true;
+        return !isCodeCopyButton(el) && !isTableCopyButton(el);
+    };
+
+    const findTurnCopyButton = (root) => {
+        const actionContainer = root.querySelector(".turn-action-controls, [class*='turn-action'], [data-testid*='turn-action']");
+        if (actionContainer) {
+            for (const selector of copySelectors) {
+                const btn = actionContainer.querySelector(selector);
+                if (btn && isVisible(btn)) return btn;
+            }
+        }
+        const candidates = [];
+        for (const selector of copySelectors) {
+            const matches = Array.from(root.querySelectorAll(selector)).filter(isTurnCopyButton);
+            for (const m of matches) {
+                if (!candidates.includes(m)) candidates.push(m);
+            }
+        }
+        const actionBtn = candidates.find((c) => isTurnActionBar(c) && isVisible(c));
+        if (actionBtn) return actionBtn;
+        const visible = candidates.filter(isVisible);
+        if (visible.length) return visible[visible.length - 1];
+        if (candidates.length) return candidates[candidates.length - 1];
         return null;
     };
     const roleOf = (root) => {
@@ -361,16 +488,45 @@ _CLICK_LATEST_COPY_BUTTON_JS = (
         if (ownRole === "assistant" || ownRole === "user") return ownRole;
         const roleEl = root.querySelector('[data-message-author-role="assistant"], [data-message-author-role="user"]');
         if (roleEl) return roleEl.getAttribute("data-message-author-role") || "";
-        if (root.matches(".agent-turn") || root.querySelector(".agent-turn") || hasGeneratedImage(root)) return "assistant";
+
+        if (
+            root.matches('[data-user-message-bubble], [data-markdown-text-tone="user-message"], .rich-text-user-turn, [data-chatgpt-search-unit-key*="user"], [data-content-search-turn-key*="user"], [class*="group/user-message"]') ||
+            root.querySelector('[data-user-message-bubble], [data-markdown-text-tone="user-message"], .rich-text-user-turn, [data-chatgpt-search-unit-key*="user"], [data-content-search-turn-key*="user"], [class*="group/user-message"]')
+        ) {
+            return "user";
+        }
+
+        if (
+            root.matches(".agent-turn, [data-chatgpt-search-unit-key*='assistant'], [data-content-search-unit-key*='assistant']") ||
+            root.querySelector(".agent-turn, [data-chatgpt-search-unit-key*='assistant'], [data-content-search-unit-key*='assistant']") ||
+            hasGeneratedImage(root) ||
+            Boolean(findTurnCopyButton(root)) ||
+            root.matches(".turn-action-controls") ||
+            root.querySelector(".turn-action-controls") ||
+            root.matches('[class*="MarkdownRoot"]:not([data-markdown-text-tone="user-message"])') ||
+            root.querySelector('[class*="MarkdownRoot"]:not([data-markdown-text-tone="user-message"])') ||
+            root.querySelector(".markdown, .prose")
+        ) {
+            return "assistant";
+        }
+
+        const label = [
+            root.getAttribute("aria-label") || "",
+            root.getAttribute("data-testid") || "",
+            textOf(root.querySelector("h4.sr-only, h5.sr-only, h6.sr-only")),
+            textOf(root).slice(0, 100)
+        ].join(" ").toLowerCase();
+        if (label.includes("you said")) return "user";
+        if (label.includes("chatgpt said") || label.includes("chatgpt")) return "assistant";
         return "";
     };
     const stableIdOf = (root) => {
-        const attrs = ["data-message-id", "data-turn-id", "data-testid", "data-testid-message-id", "id"];
+        const attrs = ["data-turn-key", "data-content-search-turn-key", "data-chatgpt-search-unit-key", "data-message-id", "data-turn-id", "data-testid", "data-testid-message-id", "id"];
         for (const attr of attrs) {
             const value = root.getAttribute(attr);
             if (value) return value;
         }
-        const child = root.querySelector("[data-message-id], [data-turn-id], [data-testid-message-id]");
+        const child = root.querySelector("[data-turn-key], [data-content-search-turn-key], [data-chatgpt-search-unit-key], [data-message-id], [data-turn-id], [data-testid-message-id]");
         if (child) {
             for (const attr of attrs) {
                 const value = child.getAttribute(attr);
@@ -406,16 +562,23 @@ _CLICK_LATEST_COPY_BUTTON_JS = (
     const rootSet = new Set();
     const addRoot = (el) => {
         if (!el) return;
-        rootSet.add(el.closest([
+        const promoted = el.closest([
             "article",
             'section[data-testid^="conversation-turn-"]',
             'div[data-testid^="conversation-turn-"]',
             'section[data-turn]',
-            'div[data-turn]'
-        ].join(",")) || el);
+            'div[data-turn]',
+            '[data-turn-key]',
+            '[data-content-search-turn-key]',
+            '[data-chatgpt-search-unit-key]',
+            '[data-user-message-bubble]',
+            'div[class*="group/conversation-turn"]',
+            'div[class*="group/user-message"]'
+        ].join(",")) || el;
+        rootSet.add(promoted);
     };
     for (const selector of """
-    + _selector_list_js(list(Selectors.ASSISTANT_MESSAGE) + ["article", 'section[data-testid^="conversation-turn-"]', 'div[data-testid^="conversation-turn-"]', '[data-testid*="conversation-turn" i]', 'section[data-turn]', 'div[data-turn]', '[data-message-author-role="assistant"]', '.agent-turn', 'div[class*="group/conversation-turn"]'])
+    + _selector_list_js(list(Selectors.ASSISTANT_MESSAGE) + ["article", 'section[data-testid^="conversation-turn-"]', 'div[data-testid^="conversation-turn-"]', '[data-testid*="conversation-turn" i]', 'section[data-turn]', 'div[data-turn]', '[data-message-author-role="assistant"]', '.agent-turn', 'div[class*="group/conversation-turn"]', '[data-turn-key]', '[data-content-search-turn-key]', '[data-chatgpt-search-unit-key]', '[class*="MarkdownRoot"]', '.turn-action-controls', 'button[data-testid*="copy-turn" i]', "button[aria-label*='Copy' i]"])
     + r""") {
         for (const el of document.querySelectorAll(selector)) addRoot(el);
     }
@@ -463,6 +626,20 @@ _CLICK_LATEST_COPY_BUTTON_JS = (
             if (btn) break;
         }
     }
+    if (!btn) {
+        for (const selector of copySelectors) {
+            const matches = Array.from(document.querySelectorAll(selector)).filter(isTurnCopyButton);
+            const visible = matches.filter(isVisible);
+            if (visible.length) {
+                btn = visible[visible.length - 1];
+                break;
+            }
+            if (matches.length) {
+                btn = matches[matches.length - 1];
+                break;
+            }
+        }
+    }
     if (!btn) return { clicked: false, reason: "no-copy-button", signature: latest.signature };
     btn.click();
     return { clicked: true, reason: "ok", signature: latest.signature };
@@ -498,16 +675,45 @@ _LATEST_IMAGE_EXTRACTION_JS = r"""
         if (ownRole === "assistant" || ownRole === "user") return ownRole;
         const roleEl = root.querySelector('[data-message-author-role="assistant"], [data-message-author-role="user"]');
         if (roleEl) return roleEl.getAttribute("data-message-author-role") || "";
-        if (root.matches(".agent-turn") || root.querySelector(".agent-turn") || hasGeneratedImage(root)) return "assistant";
+
+        if (
+            root.matches('[data-user-message-bubble], [data-markdown-text-tone="user-message"], .rich-text-user-turn, [data-chatgpt-search-unit-key*="user"], [data-content-search-turn-key*="user"], [class*="group/user-message"]') ||
+            root.querySelector('[data-user-message-bubble], [data-markdown-text-tone="user-message"], .rich-text-user-turn, [data-chatgpt-search-unit-key*="user"], [data-content-search-turn-key*="user"], [class*="group/user-message"]')
+        ) {
+            return "user";
+        }
+
+        if (
+            root.matches(".agent-turn, [data-chatgpt-search-unit-key*='assistant'], [data-content-search-unit-key*='assistant']") ||
+            root.querySelector(".agent-turn, [data-chatgpt-search-unit-key*='assistant'], [data-content-search-unit-key*='assistant']") ||
+            hasGeneratedImage(root) ||
+            Boolean(findTurnCopyButton(root)) ||
+            root.matches(".turn-action-controls") ||
+            root.querySelector(".turn-action-controls") ||
+            root.matches('[class*="MarkdownRoot"]:not([data-markdown-text-tone="user-message"])') ||
+            root.querySelector('[class*="MarkdownRoot"]:not([data-markdown-text-tone="user-message"])') ||
+            root.querySelector(".markdown, .prose")
+        ) {
+            return "assistant";
+        }
+
+        const label = [
+            root.getAttribute("aria-label") || "",
+            root.getAttribute("data-testid") || "",
+            textOf(root.querySelector("h4.sr-only, h5.sr-only, h6.sr-only")),
+            textOf(root).slice(0, 100)
+        ].join(" ").toLowerCase();
+        if (label.includes("you said")) return "user";
+        if (label.includes("chatgpt said") || label.includes("chatgpt")) return "assistant";
         return "";
     };
     const stableIdOf = (root) => {
-        const attrs = ["data-message-id", "data-turn-id", "data-testid", "data-testid-message-id", "id"];
+        const attrs = ["data-turn-key", "data-content-search-turn-key", "data-chatgpt-search-unit-key", "data-message-id", "data-turn-id", "data-testid", "data-testid-message-id", "id"];
         for (const attr of attrs) {
             const value = root.getAttribute(attr);
             if (value) return value;
         }
-        const child = root.querySelector("[data-message-id], [data-turn-id], [data-testid-message-id]");
+        const child = root.querySelector("[data-turn-key], [data-content-search-turn-key], [data-chatgpt-search-unit-key], [data-message-id], [data-turn-id], [data-testid-message-id]");
         if (child) {
             for (const attr of attrs) {
                 const value = child.getAttribute(attr);
@@ -524,7 +730,11 @@ _LATEST_IMAGE_EXTRACTION_JS = r"""
             'section[data-testid^="conversation-turn-"]',
             'div[data-testid^="conversation-turn-"]',
             'section[data-turn]',
-            'div[data-turn]'
+            'div[data-turn]',
+            '[data-turn-key]',
+            '[data-content-search-turn-key]',
+            '[data-chatgpt-search-unit-key]',
+            'div[class*="group/conversation-turn"]'
         ].join(",")) || el);
     };
     for (const selector of [
@@ -536,7 +746,12 @@ _LATEST_IMAGE_EXTRACTION_JS = r"""
         'div[data-turn]',
         '[data-message-author-role="assistant"]',
         ".agent-turn",
-        'div[class*="group/conversation-turn"]'
+        'div[class*="group/conversation-turn"]',
+        '[data-turn-key]',
+        '[data-content-search-turn-key]',
+        '[data-chatgpt-search-unit-key]',
+        'div[id^="image-"]',
+        'div[class*="imagegen-image"]'
     ]) {
         for (const el of document.querySelectorAll(selector)) addRoot(el);
     }
@@ -625,6 +840,7 @@ def normalize_assistant_text(text: str | None) -> str:
     cleaned = (text or "").strip()
     cleaned = re.sub(r"^ChatGPT said:\s*", "", cleaned, flags=re.IGNORECASE).strip()
     cleaned = re.sub(r"^You said:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^Finished with \d+ steps\s*", "", cleaned, flags=re.IGNORECASE).strip()
     return cleaned
 
 
@@ -872,6 +1088,8 @@ async def wait_for_response_complete(
     if completed == "copy":
         log.info("Response complete - copy button appeared on latest turn")
         return True
+    if completed == "text":
+        return True
     if completed == "image":
         log.info("Response complete - generated image detected on latest turn")
         return True
@@ -893,6 +1111,7 @@ async def wait_for_response_complete(
         return False
 
     log.info("Falling back to text-stability detection...")
+    await _scroll_to_bottom(page)
     try:
         return await _wait_via_text_stability(page, remaining, previous_turn_signature)
     except Exception as e:
@@ -904,22 +1123,62 @@ async def _check_page_error(page: Page) -> str | None:
     """Check if the page is showing an error state (DNS failure, crash, etc.).
 
     Returns error description string if an error is detected, None otherwise.
+
+    IMPORTANT: We must NOT search document.body.innerText because that includes
+    all conversation messages — if ChatGPT's *response* contains an error string
+    like ERR_CONNECTION_REFUSED (e.g. relayed browser-console output) this would
+    generate a false positive.  We scope the check to the page URL/title and to
+    UI elements that live *outside* the conversation thread scroll container.
     """
     try:
         error = await page.evaluate(
             """
             () => {
-                // Chrome error pages
-                const body = document.body ? document.body.innerText : '';
-                if (body.includes('DNS_PROBE_FINISHED_NXDOMAIN')) return 'DNS_PROBE_FINISHED_NXDOMAIN';
-                if (body.includes('ERR_NAME_NOT_RESOLVED')) return 'ERR_NAME_NOT_RESOLVED';
-                if (body.includes('ERR_CONNECTION_REFUSED')) return 'ERR_CONNECTION_REFUSED';
-                if (body.includes('ERR_INTERNET_DISCONNECTED')) return 'ERR_INTERNET_DISCONNECTED';
-                if (body.includes('ERR_CONNECTION_TIMED_OUT')) return 'ERR_CONNECTION_TIMED_OUT';
-                // ChatGPT error states
-                if (body.includes('Something went wrong')) return 'ChatGPT_something_went_wrong';
-                if (body.includes("We're experiencing high demand")) return 'ChatGPT_high_demand';
-                if (document.title && document.title.includes('is not available')) return 'page_not_available';
+                // --- URL / title heuristics (reliable, no false positives) ---
+                const url = location.href;
+                const title = document.title || '';
+
+                // Chrome built-in error pages have a distinctive URL scheme
+                if (url.startsWith('chrome-error://') || url.startsWith('about:neterror')) {
+                    return 'browser_error_page';
+                }
+                if (title.includes('is not available')) return 'page_not_available';
+
+                // --- Inspect only text OUTSIDE the thread scroll container.
+                //     The conversation lives inside the thread scroller, so
+                //     restricting our search to elements outside it prevents
+                //     false positives from conversation content. ---
+                const thread = document.querySelector(
+                    '[data-app-action-timeline-scroll], .thread-scroll-container'
+                );
+                const main = document.querySelector('main') || document.body;
+
+                const walker = document.createTreeWalker(
+                    main,
+                    NodeFilter.SHOW_TEXT,
+                    {
+                        acceptNode(node) {
+                            if (thread && thread.contains(node)) return NodeFilter.FILTER_REJECT;
+                            return NodeFilter.FILTER_ACCEPT;
+                        }
+                    }
+                );
+                let bannerText = '';
+                let node;
+                while ((node = walker.nextNode())) {
+                    bannerText += node.textContent;
+                    if (bannerText.length > 2000) break;
+                }
+
+                if (bannerText.includes('DNS_PROBE_FINISHED_NXDOMAIN')) return 'DNS_PROBE_FINISHED_NXDOMAIN';
+                if (bannerText.includes('ERR_NAME_NOT_RESOLVED')) return 'ERR_NAME_NOT_RESOLVED';
+                if (bannerText.includes('ERR_INTERNET_DISCONNECTED')) return 'ERR_INTERNET_DISCONNECTED';
+                if (bannerText.includes('ERR_CONNECTION_TIMED_OUT')) return 'ERR_CONNECTION_TIMED_OUT';
+                // ERR_CONNECTION_REFUSED is intentionally excluded — it appears too
+                // often inside conversation content (relayed console logs, etc.)
+
+                if (bannerText.includes("We're experiencing high demand")) return 'ChatGPT_high_demand';
+
                 return null;
             }
             """
@@ -929,6 +1188,28 @@ async def _check_page_error(page: Page) -> str | None:
         return None
 
 
+async def _scroll_to_bottom(page: Page) -> None:
+    """Scroll the ChatGPT thread container to the bottom so the latest turn
+    is rendered by the virtualiser and visible to the DOM scanner."""
+    try:
+        await page.evaluate(
+            """
+            () => {
+                const scroller = document.querySelector(
+                    '[data-app-action-timeline-scroll], .thread-scroll-container'
+                );
+                if (scroller) {
+                    scroller.scrollTop = scroller.scrollHeight;
+                } else {
+                    window.scrollTo(0, document.body.scrollHeight);
+                }
+            }
+            """
+        )
+    except Exception:
+        pass
+
+
 async def _wait_for_copy_button_or_image(
     page: Page,
     pre_copy_count: int,
@@ -936,12 +1217,19 @@ async def _wait_for_copy_button_or_image(
     previous_turn_signature: str | None = None,
 ) -> str | None:
     """Wait for either copy-button readiness or generated image on the latest turn."""
+    started = time.monotonic()
+    stable_key = None
+    stable_since = started
     elapsed = 0.0
     poll_interval = Config.POLL_INTERVAL_MS / 1000
     heartbeat = 10
     first_snapshot_logged = False
 
-    while elapsed * 1000 < timeout_ms:
+    # Scroll to bottom so that the virtualised thread renders the latest turn.
+    await _scroll_to_bottom(page)
+
+    while (time.monotonic() - started) * 1000 < timeout_ms:
+        elapsed = time.monotonic() - started
         try:
             snapshot = await _latest_assistant_turn_snapshot(page)
         except TargetClosedError:
@@ -986,6 +1274,23 @@ async def _wait_for_copy_button_or_image(
             await asyncio.sleep(Config.RESPONSE_SETTLE_MS / 1000)
             log.debug(f"Generated image detected on latest turn {signature}")
             return "image"
+
+        # Some layouts hide the turn toolbar. Check the existing text-stability
+        # signal alongside toolbar signals, rather than after their full timeout.
+        text = snapshot.get("text") or ""
+        eligible = (
+            is_new_turn and bool(signature) and bool(text)
+            and not snapshot.get("hasStopButton")
+            and not is_incomplete_response_text(text)
+        )
+        key = (signature, text) if eligible else None
+        now = time.monotonic()
+        if key is None or key != stable_key:
+            stable_key = key
+            stable_since = now
+        elif now - stable_since >= 2.0:
+            log.info("Latest answer text stable without active generation; response complete")
+            return "text"
 
         if int(elapsed) > 0 and int(elapsed) % heartbeat == 0:
             log.debug(f"Still waiting for copy button or image... ({int(elapsed)}s)")
@@ -1131,14 +1436,15 @@ async def extract_last_response_via_copy(
         click_result = await page.evaluate(_CLICK_LATEST_COPY_BUTTON_JS, previous_turn_signature)
 
         if isinstance(click_result, dict) and click_result.get("clicked"):
-            await asyncio.sleep(0.3)
-            content = await page.evaluate("navigator.clipboard.readText().catch(() => '')")
-            if content and content.strip() and content.strip() != str(pre_clipboard).strip():
-                log.info(
-                    "Extracted via copy button (latest-turn): "
-                    f"{len(content)} chars, turn={click_result.get('signature')}"
-                )
-                return content.strip()
+            for _ in range(15):
+                await asyncio.sleep(0.15)
+                content = await page.evaluate("navigator.clipboard.readText().catch(() => '')")
+                if content and content.strip() and content.strip() != str(pre_clipboard).strip():
+                    log.info(
+                        "Extracted via copy button (latest-turn): "
+                        f"{len(content)} chars, turn={click_result.get('signature')}"
+                    )
+                    return content.strip()
             log.debug("Clipboard unchanged/empty after latest-turn copy click")
         else:
             reason = click_result.get("reason") if isinstance(click_result, dict) else "unknown"

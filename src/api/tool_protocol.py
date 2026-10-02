@@ -81,6 +81,8 @@ Rules:
 - Use exact names from the definitions.
 - Arguments must be a valid JSON object.
 - Return multiple records when needed.
+- Batch independent tool calls into the same `tool_calls` array whenever their arguments can be determined from the current request and neither call depends on another call's result. This avoids unnecessary model round-trips.
+- Keep dependent operations in later rounds only when a later call genuinely requires data produced by an earlier call.
 - Do not include prose or Markdown around the JSON document.
 - {choice_rule}
 """
@@ -101,9 +103,13 @@ def build_tool_continuation_prompt(
         if name:
             rule = f"Return a {name!r} tool call. Do not answer with prose."
     return (
-        "Cursor executes tool-call JSON against the local workspace. Do not say files or tools "
-        "are unavailable. Use the schemas already established in this chat and return exactly "
+        "The editor client executes tool-call JSON against the local workspace. You have full access "
+        "to inspect and edit the workspace via these tools. Do not say files, repositories, or tools "
+        "are unavailable or unmounted, and do not ask the user to connect GitHub or make changes manually. "
+        "Use the schemas already established in this chat and return exactly "
         '{"tool_calls":[{"name":"<function_name>","arguments":{...}}]} when calling a tool. '
+        "Batch independent calls into one tool_calls array whenever they do not depend on each "
+        "other's results. Keep dependent calls for later rounds only when necessary. "
         f"Available tool names: {names}. {rule}"
     )
 
@@ -139,12 +145,17 @@ _GEMINI_TOOL_PREFER_TOKENS = (
 _GEMINI_TOOL_CARD_MAX_CHARS = 1600
 _GEMINI_TOOL_CARD_MAX_TOOLS = 12
 _GEMINI_REFUSAL_RE = re.compile(
-    r"(don'?t|do not|cannot|can't|unable).{0,80}(terminal|permission|access|execut|run command)|"
-    r"don'?t have direct access|"
+    r"(don['’]?t|do not|cannot|can['’]?t|unable|not able).{0,100}(terminal|permission|access|execut|run command|workspace|mounted|file system|filesystem|editing tool|edit (directly|files?|the code)|modify (directly|files?|the code))|"
+    r"don['’]?t have (direct access|a connected workspace|access to (the|your) (repo|repository|workspace|files?|local))|"
+    r"project source (itself )?isn['’]?t mounted|"
+    r"not mounted in this chat|"
+    r"connect (to )?github|"
     r"i am gemini|"
     r"run (it|this|the command) (yourself|manually)|"
+    r"apply (it|this|the change) (yourself|manually)|"
+    r"make (the change|these changes) (yourself|manually)|"
     r"integrated terminal|"
-    r"no (terminal|permission)",
+    r"no (terminal|permission|access to the file)",
     re.IGNORECASE,
 )
 _GEMINI_ACTION_RE = re.compile(
@@ -202,8 +213,7 @@ def _gemini_choice_rule(
     if tool_choice == "required" or _GEMINI_ACTION_RE.search(user_text or ""):
         return (
             "The user asked for a workspace action. You MUST choose tool_calls "
-            "and include at least one listed function. Do not use final. "
-            "Do not say you are Gemini."
+            "and include at least one listed function. Do not use final."
         )
     if isinstance(tool_choice, dict):
         selected = tool_choice.get("function")
@@ -231,13 +241,12 @@ def build_gemini_browser_tool_prompt(
     names = ", ".join(tool.function.name for tool in picked)
     choice_rule = _gemini_choice_rule(tools, tool_choice, user_text)
     reminder = (
-        "You are Copilot's JSON planner, not a chatbot. VS Code executes functions "
-        "on the local machine after your reply. You do not have a terminal; Copilot does. "
-        "Never say you lack permissions, a terminal, or files. Never tell the user to run "
-        "a command themselves.\n"
+        "You are Copilot's JSON planner for VS Code. VS Code executes functions "
+        "on the local machine on your behalf after your reply. "
+        "Use available functions to inspect files or run commands instead of telling the user to run them.\n"
         "Your ENTIRE reply must be exactly one of these JSON objects:\n"
         '{"tool_calls":[{"name":"<function_name>","arguments":{...}}]}\n'
-        '{"final":"<answer when no function is needed>"}\n'
+        '{"final":"<answer or explanation when no function is needed>"}\n'
         "Never put a command for the user to run inside final. "
         f"No markdown. {choice_rule}"
     )
@@ -278,13 +287,14 @@ def build_gemini_tool_repair_prompt(
     names = ", ".join(tool.function.name for tool in _pick_gemini_tools(tools))
     asked = (user_text or "").strip()[:400]
     return (
-        "Your previous reply was not usable by Copilot. You are not chatting as Gemini. "
-        "This is only JSON translation. Do not say you lack access. Do not give the user "
-        "a bash snippet. Reply with ONLY:\n"
+        "Your previous reply was not usable by Copilot. Format your response strictly as JSON. "
+        "VS Code executes functions on your behalf. "
+        "Reply with ONLY one of these JSON objects:\n"
         '{"tool_calls":[{"name":"<function_name>","arguments":{...}}]}\n'
-        f"Use one of: {names}.\n"
+        '{"final":"<answer or explanation if no function is needed>"}\n'
+        f"Available functions: {names}.\n"
         f"User request: {asked or '(see prior turn)'}\n"
-        f"Invalid previous reply: {(response_text or '')[:400]}"
+        f"Previous reply: {(response_text or '')[:400]}"
     )
 
 
@@ -351,6 +361,13 @@ def parse_tool_calls_outcome(response_text: str, tools: list[ToolDefinition]) ->
         if name not in valid_names:
             diagnostics.append(f"{prefix}.name is unknown: {name!r}")
             continue
+        if isinstance(arguments, str):
+            try:
+                parsed_args = json.loads(arguments)
+                if isinstance(parsed_args, dict):
+                    arguments = parsed_args
+            except Exception:
+                pass
         if isinstance(arguments, dict):
             arguments = _close_unbalanced_quotes_in_args(arguments)
             spec = next((tool.function.parameters for tool in tools if tool.function.name == name), {})
@@ -375,6 +392,18 @@ def parse_tool_calls_outcome(response_text: str, tools: list[ToolDefinition]) ->
     return ToolParseOutcome(calls, True)
 
 
+def _normalize_tool_call_payload(parsed: Any) -> dict[str, Any] | None:
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("tool_calls"), list):
+            return parsed
+        if "name" in parsed or "function" in parsed:
+            return {"tool_calls": [parsed]}
+    elif isinstance(parsed, list) and parsed:
+        if all(isinstance(x, dict) and ("name" in x or "function" in x) for x in parsed):
+            return {"tool_calls": parsed}
+    return None
+
+
 def _decode_tool_calls_payload(response_text: str) -> dict[str, Any] | None:
     """Decode a tool-call JSON object, repairing common model mistakes."""
     decoder = json.JSONDecoder(strict=False)
@@ -393,8 +422,9 @@ def _decode_tool_calls_payload(response_text: str) -> dict[str, Any] | None:
                 parsed, _ = decoder.raw_decode(blob)
             except json.JSONDecodeError:
                 continue
-            if isinstance(parsed, dict) and isinstance(parsed.get("tool_calls"), list):
-                return parsed
+            normalized = _normalize_tool_call_payload(parsed)
+            if normalized is not None:
+                return normalized
     return None
 
 
@@ -402,20 +432,38 @@ def _tool_call_json_candidates(response_text: str) -> list[str]:
     text = (response_text or "").strip()
     if not text:
         return []
-    fenced = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    fenced = re.sub(r"\s*```$", "", fenced)
     candidates: list[str] = []
     seen: set[str] = set()
+
+    def add_candidate(s: str) -> None:
+        trimmed = s.strip()
+        if trimmed and trimmed not in seen:
+            seen.add(trimmed)
+            candidates.append(trimmed)
+
+    # XML tag envelopes: <tool_call>...</tool_call>
+    xml_matches = re.findall(r"<\s*tool_call\s*>(.*?)<\s*/\s*tool_call\s*>", text, flags=re.DOTALL | re.IGNORECASE)
+    if xml_matches:
+        for match in xml_matches:
+            add_candidate(match)
+        if len(xml_matches) > 1:
+            combined = "[" + ",".join(m.strip() for m in xml_matches if m.strip()) + "]"
+            add_candidate(combined)
+
+    fenced = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    fenced = re.sub(r"\s*```$", "", fenced)
     for source in (text, fenced):
-        for pattern in (r'\{\s*"tool_calls"\s*:', r'\{\s*"final"\s*:'):
+        for pattern in (
+            r'\{\s*"tool_calls"\s*:',
+            r'\{\s*"final"\s*:',
+            r'\[\s*\{\s*"(?:name|function)"\s*:',
+            r'\{\s*"(?:name|function)"\s*:',
+        ):
             for match in re.finditer(pattern, source):
                 snippet = source[match.start():].strip()
-                if snippet and snippet not in seen:
-                    seen.add(snippet)
-                    candidates.append(snippet)
-        if source.startswith("{") and source not in seen:
-            seen.add(source)
-            candidates.append(source)
+                add_candidate(snippet)
+        if (source.startswith("{") or source.startswith("[")) and source not in seen:
+            add_candidate(source)
     return candidates
 
 

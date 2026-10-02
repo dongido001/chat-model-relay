@@ -378,6 +378,7 @@ class BrowserManager:
             locale="en-US",
             timezone_id="America/Los_Angeles",
             args=chrome_args,
+            ignore_default_args=["--enable-automation", "--no-sandbox"] if not in_docker else ["--enable-automation"],
         )
         if in_docker:
             launch_kwargs["no_viewport"] = True

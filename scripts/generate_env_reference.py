@@ -69,6 +69,8 @@ SECTIONS: tuple[tuple[str, tuple[tuple[str, str, str], ...]], ...] = (
         ("API_CONVERSATION_DB", "state/conversations.sqlite3", "SQLite store for durable logical-conversation and Responses routing."),
         ("API_CONVERSATION_RETENTION_SECONDS", "2592000", "Maximum age of durable conversation routes (30 days by default)."),
         ("API_CONVERSATION_MAX_ROUTES", "10000", "Maximum number of durable conversation routes retained."),
+        ("API_PROJECT_THREAD_MAX_CHARS", "400000", "Transcript size that triggers a new project-scoped browser chat; `0` disables the limit."),
+        ("API_PROJECT_THREAD_CONTEXT_CHARS", "12000", "Recent project conversation excerpt kept when rotating to a new chat."),
         ("API_TRACE_ENABLED", "false", "Write sanitized per-round protocol traces for diagnostics."),
         ("API_TRACE_DIR", "state/traces", "Directory for opt-in JSONL protocol traces."),
         ("API_TRACE_MAX_CHARS", "200000", "Maximum characters retained in each traced string value."),

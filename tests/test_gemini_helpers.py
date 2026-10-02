@@ -215,6 +215,21 @@ class GeminiProviderTests(unittest.TestCase):
                 "I am Gemini, an AI assistant, so I don't have direct access to your local machine"
             )
         )
+        self.assertTrue(
+            looks_like_workspace_refusal(
+                "I can fix it, but in this chat I don’t currently have a connected workspace/GitHub editing tool for the repo itself."
+            )
+        )
+        self.assertTrue(
+            looks_like_workspace_refusal(
+                "Connect GitHub using the option I surfaced, and I can apply the change directly to dongido001/chat-model-relay"
+            )
+        )
+        self.assertTrue(
+            looks_like_workspace_refusal(
+                "I can fix it, but the project source itself isn't mounted in this chat session."
+            )
+        )
         self.assertFalse(looks_like_workspace_refusal('{"tool_calls":[]}'))
 
     def test_gemini_tool_prompt_requires_structured_envelope(self) -> None:

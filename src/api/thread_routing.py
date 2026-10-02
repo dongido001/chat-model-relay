@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from urllib.parse import urlparse
@@ -25,6 +26,7 @@ _APP_KEY_HEADERS = (
     "x-requested-with",
 )
 _CONVERSATION_ID_HEADER = "x-catgpt-conversation-id"
+_PROJECT_ID_HEADER = "x-catgpt-project-id"
 
 
 def _host_from_header_url(value: str) -> str:
@@ -72,6 +74,84 @@ def _tab_session_key(request: Any, http_request: Request | None, app_key: str = 
 def _project_key() -> str:
     project_getter = getattr(Config, "chatgpt_project_url", None)
     return (project_getter() if callable(project_getter) else "") or "global"
+
+
+def _project_conversation_key(request: Any, http_request: Request | None) -> str:
+    """Return a stable project route key when the client exposes project context.
+
+    Prefer an explicit project ID. Codex/Copilot tool requests commonly include
+    their workspace ``workdir``/``cwd`` in tool arguments; hash that path as a
+    fallback so project paths are never written into the route database.
+    An empty result leaves the caller's normal conversation-level routing intact.
+    """
+    explicit = (getattr(request, "project_id", None) or "").strip()
+    if not explicit and http_request is not None:
+        explicit = (http_request.headers.get(_PROJECT_ID_HEADER) or "").strip()
+    if len(explicit) > 512:
+        raise HTTPException(status_code=400, detail="project id is too long")
+    if explicit:
+        identity = "id:" + explicit
+    else:
+        paths: list[str] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, str):
+                scan = value.replace('\\"', '"')
+                for match in re.finditer(
+                    r'''["']?(?:workdir|cwd|workspace_folder|workspacefolder|workspace_root|project_root)["']?\s*[:=]\s*["']([^"']+)["']''',
+                    scan,
+                    re.IGNORECASE,
+                ):
+                    paths.append(match.group(1).strip())
+                for match in re.finditer(
+                    r"(?:current working directory|workspace(?: root| folder)?|project root|cwd|workdir)"
+                    r"\s*(?:is|:|=)\s*[`\"']?((?:/|[A-Za-z]:\\)[^\r\n`\"']+)",
+                    scan,
+                    re.IGNORECASE,
+                ):
+                    paths.append(match.group(1).strip().rstrip(".,;"))
+                return
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if str(key).lower() in {
+                        "workdir", "cwd", "workspace_folder", "workspace_root", "project_root"
+                    } and isinstance(item, str):
+                        paths.append(item.strip())
+                    else:
+                        collect(item)
+                return
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+                return
+            dump = getattr(value, "model_dump", None)
+            if callable(dump):
+                collect(dump(mode="json", exclude_none=True))
+                return
+            legacy_dump = getattr(value, "dict", None)
+            if callable(legacy_dump):
+                collect(legacy_dump(exclude_none=True))
+
+        for message in getattr(request, "messages", []) or []:
+            collect(getattr(message, "content", None))
+            collect(getattr(message, "tool_calls", None))
+        if not paths:
+            return ""
+        # Use the most frequently repeated working directory. Full editor
+        # history often carries older workdirs alongside the active workspace.
+        counts: dict[str, int] = {}
+        for path in paths:
+            candidate = os.path.normcase(os.path.normpath(path)).rstrip("/\\")
+            if not candidate or candidate == ".":
+                continue
+            counts[candidate] = counts.get(candidate, 0) + 1
+        if not counts:
+            return ""
+        last_seen = {path: index for index, path in enumerate(paths)}
+        identity = "path:" + max(counts, key=lambda path: (counts[path], last_seen[path]))
+
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+    return f"project:{digest}"
 
 
 def _conversation_id_from_request(request: ChatCompletionRequest, http_request: Request | None) -> str:
@@ -184,6 +264,7 @@ __all__ = [
     "_session_id_from_request",
     "_tab_session_key",
     "_project_key",
+    "_project_conversation_key",
     "_conversation_id_from_request",
     "_responses_conversation_id",
     "_derive_app_key",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from src.api.openai_schemas import FunctionCallInfo, FunctionDefinition, ToolCall, ToolDefinition
+from src.api.openai_schemas import FunctionCallInfo, FunctionDefinition, ResponsesRequest, ToolCall, ToolDefinition
 from src.api.tool_translation import (
     build_tool_repair_prompt,
     looks_like_tool_call_intent,
@@ -48,6 +48,41 @@ def _call(name: str, arguments: object, call_id: str = "call_1") -> ToolCall:
 
 
 class ToolTranslationTests(unittest.TestCase):
+    def test_accepts_flat_responses_api_function_tool(self) -> None:
+        tool = ToolDefinition.model_validate({
+            "type": "function",
+            "name": "exec_command",
+            "description": "Run a command.",
+            "parameters": {"type": "object", "properties": {}},
+        })
+        self.assertEqual(tool.function.name, "exec_command")
+        self.assertEqual(tool.function.description, "Run a command.")
+
+    def test_expands_responses_api_namespace_tools(self) -> None:
+        request = ResponsesRequest.model_validate({
+            "input": "hello",
+            "tools": [{
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "tools": [{
+                    "type": "function",
+                    "name": "close_agent",
+                    "parameters": {"type": "object", "properties": {}},
+                }],
+            }],
+        })
+        self.assertEqual([tool.function.name for tool in request.tools or []], ["close_agent"])
+
+    def test_ignores_unsupported_responses_builtin_tools(self) -> None:
+        request = ResponsesRequest.model_validate({
+            "input": "hello",
+            "tools": [
+                {"type": "web_search", "external_web_access": False},
+                {"type": "function", "name": "read_file", "parameters": {"type": "object"}},
+            ],
+        })
+        self.assertEqual([tool.function.name for tool in request.tools or []], ["read_file"])
+
     def test_detects_explicit_tool_call_intent(self) -> None:
         self.assertTrue(looks_like_tool_call_intent('{"tool_calls":[', _tools()))
         self.assertFalse(looks_like_tool_call_intent("Here is the final answer.", _tools()))
@@ -135,6 +170,48 @@ class ToolTranslationTests(unittest.TestCase):
         self.assertIsNone(outcome.calls)
         self.assertIn("is unknown", outcome.diagnostics[0])
 
+
+    def test_parse_tool_calls_accepts_unwrapped_single_call(self) -> None:
+        outcome = parse_tool_calls_outcome(
+            '{"name": "read_file", "arguments": {"path": "src/main.py"}}',
+            _tools(),
+        )
+        self.assertTrue(outcome.has_tool_intent)
+        self.assertIsNotNone(outcome.calls)
+        self.assertEqual(len(outcome.calls), 1)
+        self.assertEqual(outcome.calls[0].function.name, "read_file")
+        self.assertEqual(json.loads(outcome.calls[0].function.arguments), {"path": "src/main.py"})
+
+    def test_parse_tool_calls_accepts_json_array_of_calls(self) -> None:
+        outcome = parse_tool_calls_outcome(
+            '[{"name": "read_file", "arguments": {"path": "a.py"}}, {"name": "read_file", "arguments": {"path": "b.py"}}]',
+            _tools(),
+        )
+        self.assertTrue(outcome.has_tool_intent)
+        self.assertIsNotNone(outcome.calls)
+        self.assertEqual(len(outcome.calls), 2)
+        self.assertEqual(outcome.calls[0].function.name, "read_file")
+        self.assertEqual(outcome.calls[1].function.name, "read_file")
+
+    def test_parse_tool_calls_accepts_xml_tag_envelopes(self) -> None:
+        outcome = parse_tool_calls_outcome(
+            'I will read the file now:\n<tool_call>\n{"name": "read_file", "arguments": {"path": "README.md"}}\n</tool_call>',
+            _tools(),
+        )
+        self.assertTrue(outcome.has_tool_intent)
+        self.assertIsNotNone(outcome.calls)
+        self.assertEqual(len(outcome.calls), 1)
+        self.assertEqual(outcome.calls[0].function.name, "read_file")
+
+    def test_parse_tool_calls_accepts_string_encoded_arguments(self) -> None:
+        outcome = parse_tool_calls_outcome(
+            '{"tool_calls": [{"name": "read_file", "arguments": "{\"path\": \"config.json\"}"}]}',
+            _tools(),
+        )
+        self.assertTrue(outcome.has_tool_intent)
+        self.assertIsNotNone(outcome.calls)
+        self.assertEqual(len(outcome.calls), 1)
+        self.assertEqual(json.loads(outcome.calls[0].function.arguments), {"path": "config.json"})
 
 if __name__ == "__main__":
     unittest.main()

@@ -180,6 +180,22 @@ class ToolRoundTripTests(unittest.TestCase):
         self.assertEqual(len(client.prompts), 2)
         self.assertIn("could not be translated", client.prompts[1])
 
+    def test_gemini_unrepairable_tool_call_falls_back_to_text_when_tools_not_required(self) -> None:
+        client = _FakeGeminiProvider([
+            "I seem to be encountering an error. Can I try something else for you?",
+            "I don't have direct access to your local filesystem, but Cutline is a movie planning workspace.",
+        ])
+        response = self._run_gemini(client, ChatCompletionRequest(
+            messages=[ChatMessage(role="user", content="check the cutline project")],
+            tools=_tools(),
+            tool_choice="auto",
+            user="cursor-gemini-fallback",
+        ))
+        self.assertEqual(response.choices[0].finish_reason, "stop")
+        self.assertIsNone(response.choices[0].message.tool_calls)
+        self.assertIn("Cutline is a movie planning workspace", response.choices[0].message.content)
+        self.assertEqual(len(client.prompts), 2)
+
     def test_unrepairable_tool_call_fails_closed(self) -> None:
         client = _FakeProvider([
             '{"tool_calls":[{"name":"read_file","arguments":{}}]}',

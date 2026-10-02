@@ -98,10 +98,13 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 | `read_aloud` | bool | no | ChatGPT only. Opens `More actions` -> `Read aloud`, downloads the browser-generated audio, and returns it at `choices[0].message.audio`. |
 | `reasoning_effort` | string | no | ChatGPT reasoning level. Available values are discovered from the model picker and unsupported values are clamped to the nearest available level. |
 | `conversation_id` | string | no | Durable logical conversation ID. CatGPT verifies history before reusing the mapped browser thread. |
+| `project_id` | string | no | CatGPT extension. Reuse one browser chat across conversations in the same project. `X-CatGPT-Project-Id` is also accepted; workspace `workdir`/`cwd` tool context is detected as a fallback. |
 
 `conversation_id` may instead be supplied as `X-CatGPT-Conversation-Id`. Send either full history or only the next turn. If full history is a verified prefix of the stored transcript, CatGPT sends only the delta; divergent history starts a clean browser thread. Use `X-CatGPT-Thread-Mode: fresh` to force a new ephemeral thread. Fresh mode cannot be combined with `thread_id` or `conversation_id`.
 
-When those fields are omitted (typical Cursor / VS Code Copilot), `API_DERIVE_CONVERSATION_ID` (default `true`) assigns a conversation id from `x-session-id` / `session-id`, or from a hash of the first user message (`derived:<sha256 prefix>`). That skips app-thread coalescing so parallel Cursor chats do not share one provider thread. Explicit `conversation_id`, `thread_id`, or `X-CatGPT-Thread-Mode: fresh` still wins.
+For project-level reuse, send `project_id` (or `X-CatGPT-Project-Id`) on each request. Requests with the same project ID and ChatGPT project share one browser chat across IDE clients, even when their client conversation IDs differ. Codex/Copilot workspace paths in `workdir` or `cwd` tool arguments are used automatically when no explicit project ID is supplied. If no workspace identity is available, routing falls back to the normal per-conversation behavior. Project chats roll over at `API_PROJECT_THREAD_MAX_CHARS` (default 400,000 transcript characters) and seed the replacement with a bounded recent user/assistant excerpt. Unusable/stale thread mappings are replaced automatically.
+
+When project identity is unavailable, `API_DERIVE_CONVERSATION_ID` (default `true`) assigns a conversation id from `x-session-id` / `session-id`, or from a hash of the first user message (`derived:<sha256 prefix>`). This preserves normal per-conversation behavior. `thread_id` and `X-CatGPT-Thread-Mode: fresh` take precedence over project grouping.
 
 **Response:**
 
@@ -481,6 +484,7 @@ curl -X POST http://localhost:8000/v1/responses \
 | `read_aloud` | bool | no | ChatGPT only (same as chat completions) |
 | `reasoning` | object | no | Reasoning options such as `{"effort":"high"}`. |
 | `conversation` | string/object | no | Durable conversation identifier. An object must contain a non-empty `id`. |
+| `project_id` | string | no | CatGPT extension. Share one provider chat across separate client conversations in this project; `X-CatGPT-Project-Id` is also accepted. |
 | `previous_response_id` | string | no | Continue the response chain, or branch if the referenced response is no longer the chain head. |
 | `store` | bool | no | Retain response-chain state; defaults to `true`. |
 

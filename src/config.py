@@ -293,6 +293,14 @@ class Config:
         os.getenv("API_CONVERSATION_RETENTION_SECONDS", "2592000")
     )
     API_CONVERSATION_MAX_ROUTES: int = int(os.getenv("API_CONVERSATION_MAX_ROUTES", "10000"))
+    # Roll project-scoped browser chats over before their saved transcript gets
+    # unwieldy. A short recent-context tail is carried into the replacement chat.
+    API_PROJECT_THREAD_MAX_CHARS: int = max(
+        0, int(os.getenv("API_PROJECT_THREAD_MAX_CHARS", "400000"))
+    )
+    API_PROJECT_THREAD_CONTEXT_CHARS: int = max(
+        1000, int(os.getenv("API_PROJECT_THREAD_CONTEXT_CHARS", "12000"))
+    )
     # Opt-in sanitized protocol traces for diagnosing editor/provider translation.
     API_TRACE_ENABLED: bool = os.getenv("API_TRACE_ENABLED", "false").lower() == "true"
     API_TRACE_DIR: Path = _PROJECT_ROOT / os.getenv("API_TRACE_DIR", "state/traces")
@@ -304,7 +312,7 @@ class Config:
     # If true, merge header-only rows (null fields + note/context text) into next item note/context
     API_HEADER_ROW_MERGE_MODE: bool = os.getenv("API_HEADER_ROW_MERGE_MODE", "false").lower() == "true"
     RATE_LIMIT_SECONDS: int = int(os.getenv("RATE_LIMIT_SECONDS", "5"))
-    API_TOKEN: str = os.getenv("API_TOKEN", "")
+    API_TOKEN: str = os.getenv("API_TOKEN") or os.getenv("RELAY_API_KEY") or os.getenv("CATGPT_API_KEY") or ""
 
     # VNC
     VNC_PASSWORD: str = os.getenv("VNC_PASSWORD", "")

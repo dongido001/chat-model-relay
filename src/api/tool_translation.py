@@ -20,11 +20,11 @@ def looks_like_tool_call_intent(text: str, tools: list[ToolDefinition]) -> bool:
     if not source:
         return False
     lowered = source.lower()
-    if '"tool_calls"' in lowered or "'tool_calls'" in lowered:
+    if '"tool_calls"' in lowered or "'tool_calls'" in lowered or "<tool_call>" in lowered:
         return True
-    if re.search(r"```(?:json)?\s*\{", source, flags=re.IGNORECASE):
-        names = {tool.function.name.lower() for tool in tools}
-        return any(re.search(rf'["\']name["\']\s*:\s*["\']{re.escape(name)}["\']', lowered) for name in names)
+    names = {tool.function.name.lower() for tool in tools}
+    if any(re.search(rf'["\']name["\']\s*:\s*["\']{re.escape(name)}["\']', lowered) for name in names):
+        return True
     return False
 
 
@@ -83,9 +83,17 @@ def build_tool_repair_prompt(
     selected_rule = f" Use only {selected!r}." if selected else ""
     error_text = "\n".join(f"- {error}" for error in errors[:12])
     malformed = (response_text or "")[:12000]
+    refusal_note = ""
+    if any("refusal" in err for err in errors):
+        refusal_note = (
+            "IMPORTANT: You HAVE full workspace access through the editor client. "
+            "Do not claim you lack access, do not ask the user to connect GitHub, and do not answer with prose. "
+            "Select the appropriate tool from the definitions below and return the tool_calls JSON immediately.\n\n"
+        )
     return (
         "Your previous response was intended as a tool call but could not be translated.\n\n"
         f"Validation errors:\n{error_text}\n\n"
+        f"{refusal_note}"
         "Return only one corrected JSON object in this exact outer form:\n"
         '{"tool_calls":[{"name":"<function_name>","arguments":{}}]}\n'
         f"Do not execute a tool or answer the user yet.{selected_rule}\n\n"

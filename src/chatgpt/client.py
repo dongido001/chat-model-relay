@@ -139,6 +139,7 @@ class ChatGPTClient:
         model: str | None = None,
         reasoning_effort: str | None = None,
         read_aloud: bool = False,
+        user_query: str | None = None,
     ) -> ChatResponse:
         """
         Send a message to ChatGPT and wait for the complete response.
@@ -233,10 +234,11 @@ class ChatGPTClient:
                 temporary_prompt_path = self._create_prompt_attachment(text)
                 metrics.increment("chatgpt.long_prompt_attachment_fallback")
                 attachment_name = Path(temporary_prompt_path).name
-                submitted_text = (
-                    f"Read the attached file `{attachment_name}` as the complete user request. "
-                    "Follow its instructions exactly and use all of its content before answering. "
-                    "Later messages in this chat are follow-ups on that request."
+                resolved_user_query = (user_query or self._extract_user_query(text)).strip()
+                submitted_text = self._attachment_fallback_composer_prompt(
+                    attachment_name,
+                    text,
+                    resolved_user_query,
                 )
                 log.info(
                     "Prompt is too long for the ChatGPT composer; using attachment fallback (%s)",
@@ -275,6 +277,8 @@ class ChatGPTClient:
             if auto_submitted:
                 log.info("ChatGPT auto-submitted after text entry — skipping send button click")
             else:
+                # A prior turn may still be generating (Stop visible, Send disabled).
+                await self._clear_busy_generation()
                 send_ready = await self._wait_for_send_ready()
                 if send_ready == "disabled" and prompt_state == "prompt-too-long":
                     compact = self._compact_prompt_for_composer(text)
@@ -287,10 +291,15 @@ class ChatGPTClient:
                     await human_type(self._page, input_selector, compact)
                     submitted_text = compact
                     await random_delay()
+                    await self._clear_busy_generation()
                     await self._wait_for_send_ready()
 
                 log.info("No auto-submit detected, clicking send button")
                 send_state = await self._click_send()
+                if send_state == "disabled":
+                    # Generation may have started (or resumed) between ready-check and click.
+                    if await self._clear_busy_generation():
+                        send_state = await self._click_send()
                 sent = send_state == "clicked"
                 if send_state == "missing":
                     log.info("Send button not found, trying Enter key")
@@ -731,11 +740,10 @@ class ChatGPTClient:
             return
 
         # Already on a fresh chat — nothing to do
-        if "chatgpt.com" in self._page.url:
+        # Note: Must NOT be on a specific conversation URL (/c/ or /g/) and must have 0 turns.
+        if "chatgpt.com" in self._page.url and "/c/" not in self._page.url and "/g/" not in self._page.url:
             try:
-                turn_count = await self._page.evaluate(
-                    "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
-                )
+                turn_count = await count_assistant_messages(self._page) + await count_user_messages(self._page)
                 if turn_count == 0:
                     log.info("Already on a fresh chat — skipping navigation")
                     return
@@ -752,9 +760,7 @@ class ChatGPTClient:
                     await asyncio.sleep(Config.NAVIGATION_SETTLE_MS / 1000)
                     # Verify we're on a fresh chat
                     try:
-                        turn_count = await self._page.evaluate(
-                            "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
-                        )
+                        turn_count = await count_assistant_messages(self._page) + await count_user_messages(self._page)
                         if turn_count == 0:
                             await self._wait_for_chat_input()
                             return
@@ -1044,6 +1050,77 @@ class ChatGPTClient:
         return "ready"
 
     @staticmethod
+    def _extract_tool_names(text: str) -> list[str]:
+        if not text:
+            return []
+
+        names: list[str] = []
+
+        def add_name(candidate: str) -> None:
+            name = candidate.strip().strip("`'\" .")
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_\-.]*", name) and name not in names:
+                names.append(name)
+
+        for match in re.findall(r"Available (?:functions|tool names):\s*([^\n]+)", text, flags=re.IGNORECASE):
+            for part in re.split(r"[,;]", match):
+                add_name(part)
+
+        for name in re.findall(r'"name"\s*:\s*"([A-Za-z_][A-Za-z0-9_\-.]*)"', text):
+            add_name(name)
+
+        for name in re.findall(r"<function=([A-Za-z_][A-Za-z0-9_\-.]*)>", text):
+            add_name(name)
+
+        return names[:24]
+
+    @classmethod
+    def _attachment_fallback_composer_prompt(
+        cls,
+        attachment_name: str,
+        full_prompt: str,
+        user_query: str = "",
+    ) -> str:
+        resolved_user_query = (user_query or cls._extract_user_query(full_prompt)).strip()
+        tool_names = cls._extract_tool_names(full_prompt)
+        has_tools = (
+            bool(tool_names)
+            or "tool-calling mode" in full_prompt
+            or "Available functions:" in full_prompt
+            or "tool_calls" in full_prompt
+        )
+
+        if has_tools:
+            request_line = f"User request: {resolved_user_query}" if resolved_user_query else "User request is in the attachment."
+            tool_line = f" Available tool names: {', '.join(tool_names)}." if tool_names else ""
+            return (
+                f"{request_line}\n\n"
+                f"The attached file `{attachment_name}` contains the full editor-agent context and tool schemas. "
+                "You DO have workspace access through the editor client: the client will execute any `tool_calls` JSON you return. "
+                "Do not refuse due to missing local/editor tools. Do not summarize the attachment. "
+                "If code inspection or editing is needed, output only the JSON code block without conversational commentary, "
+                "or return ONLY this JSON object shape with no markdown and no prose: "
+                '{"tool_calls":[{"name":"<function_name>","arguments":{...}}]}. '
+                f"{tool_line} "
+                "If no tool is needed, return the direct final answer only. "
+                "Later messages in this chat are follow-ups on that request."
+            )
+
+        if resolved_user_query:
+            return (
+                f"{resolved_user_query}\n\n"
+                f"Read the attached file `{attachment_name}` as the complete context, system instructions, and specifications. "
+                "Follow its instructions exactly and answer immediately without summarizing or acknowledging the attachment. "
+                "Later messages in this chat are follow-ups on that request."
+            )
+
+        return (
+            f"Read the attached file `{attachment_name}` as the complete user request. "
+            "Follow its instructions exactly and use all of its content before answering immediately. "
+            "Do not summarize or acknowledge the file; provide only the direct response. "
+            "Later messages in this chat are follow-ups on that request."
+        )
+
+    @staticmethod
     def _create_prompt_attachment(text: str) -> str:
         """Persist a prompt as a UTF-8 temporary file for ChatGPT upload."""
         file_descriptor, filename = tempfile.mkstemp(
@@ -1069,6 +1146,53 @@ class ChatGPTClient:
     @classmethod
     def _non_image_paths(cls, paths: list[str]) -> list[str]:
         return [path for path in paths if Path(path).suffix.lower() not in cls._IMAGE_SUFFIXES]
+
+    @staticmethod
+    def _extract_user_query(text: str) -> str:
+        """Extract the core user request from prompt envelopes or markers."""
+        if not text:
+            return ""
+        queries = re.findall(
+            r"<(?:user_query|user_request|userRequest)>\s*(.*?)\s*</(?:user_query|user_request|userRequest)>",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if queries:
+            last = queries[-1].strip()
+            if last:
+                return last
+
+        sys_match = re.search(
+            r"\[System instructions?[^\]]*\]\s*.*?\n\n(.*)$",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if sys_match:
+            tail = sys_match.group(1).strip()
+            cleaned_tail = re.sub(r"^User:\s*", "", tail, flags=re.IGNORECASE).strip()
+            user_turn = re.search(
+                r"(?:^|\n)User:\s*(.*?)(?=\n(?:Assistant|System|User|\[Tool|$))",
+                cleaned_tail,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            if user_turn:
+                cand = user_turn.group(1).strip()
+                if cand and len(cand) <= 4000:
+                    return cand
+            if cleaned_tail and len(cleaned_tail) <= 4000:
+                return cleaned_tail
+
+        user_turns = re.findall(
+            r"(?:^|\n)User:\s*(.*?)(?=\n(?:Assistant|System|User|\[Tool|$))",
+            text,
+            flags=re.DOTALL,
+        )
+        if user_turns:
+            cand = user_turns[-1].strip()
+            if cand and len(cand) <= 4000:
+                return cand
+
+        return ""
 
     @staticmethod
     def _compact_prompt_for_composer(text: str) -> str:
@@ -1168,13 +1292,66 @@ class ChatGPTClient:
         except Exception as exc:
             log.debug("Could not remove composer attachments: %s", exc)
 
+    async def _clear_busy_generation(self, timeout_s: float = 30) -> bool:
+        """
+        If ChatGPT is still generating, click Stop and wait until Send can work.
+
+        A stuck Stop button leaves Send disabled and surfaces as
+        "ChatGPT send button is disabled; message was not submitted".
+        """
+        state = await self._composer_state()
+        if not state or not state.get("hasStopButton"):
+            return False
+
+        log.info("ChatGPT is still generating; interrupting so the next message can send")
+        await self.interrupt_generation()
+
+        started = time.monotonic()
+        deadline = started + timeout_s
+        retried_interrupt = False
+        while time.monotonic() < deadline:
+            state = await self._composer_state()
+            if not state:
+                await asyncio.sleep(0.4)
+                continue
+            if state.get("hasStopButton"):
+                if not retried_interrupt and time.monotonic() - started >= 5:
+                    # Still stuck after a few seconds — click Stop once more.
+                    await self.interrupt_generation()
+                    retried_interrupt = True
+                await asyncio.sleep(0.4)
+                continue
+
+            send_button = state.get("sendButton")
+            if isinstance(send_button, dict):
+                disabled = bool(send_button.get("disabled")) or str(
+                    send_button.get("ariaDisabled") or ""
+                ).lower() == "true"
+                if not disabled and send_button.get("visible", True):
+                    log.info("ChatGPT generation interrupted; Send is ready again")
+                    return True
+            # Stop cleared even if Send is not yet ready — caller can wait.
+            log.info("ChatGPT generation interrupted; Stop button cleared")
+            return True
+
+        log.warning("Timed out waiting for ChatGPT Stop to clear after interrupt")
+        return False
+
     async def _wait_for_send_ready(self, timeout_s: float = 20) -> str:
         """Wait until Send is clickable, or until it stays disabled after an upload."""
         deadline = time.monotonic() + timeout_s
         last: SendButtonState = "disabled"
+        interrupted = False
         while time.monotonic() < deadline:
             state = await self._composer_state()
             if not state:
+                await asyncio.sleep(0.4)
+                continue
+            if state.get("hasStopButton"):
+                if not interrupted:
+                    log.info("Send still blocked by an in-progress reply; interrupting generation")
+                    await self.interrupt_generation()
+                    interrupted = True
                 await asyncio.sleep(0.4)
                 continue
             send_button = state.get("sendButton")
@@ -1261,22 +1438,28 @@ class ChatGPTClient:
                         'button[data-testid="stop-button"]',
                         'button[aria-label="Stop answering"]',
                         'button[aria-label="Stop generating"]',
+                        'button[aria-label="Stop streaming"]',
                         'button[aria-label*="stop" i]'
                     ].join(',');
                     const sendSelectors = [
+                        "button[aria-label='Send' i]",
+                        "button[aria-label='Send message']",
+                        "button[aria-label='Send prompt']",
                         'button[data-testid="send-button"]',
                         '#composer-submit-button',
-                        "button[aria-label='Send prompt']",
                     ];
                     let sendButton = null;
                     for (const selector of sendSelectors) {
-                        const candidate = document.querySelector(selector);
-                        if (candidate) {
+                        const candidates = Array.from(document.querySelectorAll(selector));
+                        const matchIndex = candidates.findIndex(isVisible);
+                        if (matchIndex >= 0) {
+                            const candidate = candidates[matchIndex];
                             sendButton = {
                                 selector,
+                                matchIndex,
                                 disabled: Boolean(candidate.disabled),
                                 ariaDisabled: candidate.getAttribute('aria-disabled'),
-                                visible: isVisible(candidate),
+                                visible: true,
                             };
                             break;
                         }
@@ -1324,15 +1507,35 @@ class ChatGPTClient:
             previous_turn_signature=previous_turn_signature,
         )
 
-    async def _find_selector(self, selectors: list[str], name: str) -> str | None:
+    async def _find_selector(
+        self,
+        selectors: list[str],
+        name: str,
+        timeout: int | None = None,
+    ) -> str | None:
         """
         Try each selector in the fallback list. Return the first one that matches.
+        Uses a fast immediate check first to avoid blocking on dead selectors.
         """
+        to = timeout if timeout is not None else Config.SELECTOR_TIMEOUT
+
+        # Fast path: check if any selector is already present and visible without waiting
+        for selector in selectors:
+            try:
+                el = await self._page.query_selector(selector)
+                if el and await el.is_visible():
+                    log.debug(f"Found {name} immediately via: {selector}")
+                    return selector
+            except Exception:
+                pass
+
+        # Slow path: wait for the first selector that appears
+        per_selector_timeout = min(to, 2000)
         for selector in selectors:
             try:
                 el = await self._page.wait_for_selector(
                     selector,
-                    timeout=Config.SELECTOR_TIMEOUT,
+                    timeout=per_selector_timeout,
                     state="visible",
                 )
                 if el:
@@ -1400,37 +1603,51 @@ class ChatGPTClient:
             log.debug(f"Overlay check failed: {e}")
 
     async def interrupt_generation(self) -> None:
-        """Click ChatGPT Stop so a cancelled VS Code turn does not keep the tab busy."""
+        """Click ChatGPT Stop so a busy tab does not block the next Send."""
         from src.selectors import Selectors
 
-        selector = await self._find_selector(Selectors.STOP_BUTTON, "stop")
+        selector = await self._find_selector(Selectors.STOP_BUTTON, "stop", timeout=1200)
         if not selector:
             return
         try:
             await self._page.locator(selector).first.click(timeout=1200)
-            log.info("Clicked ChatGPT Stop after client cancel")
+            log.info("Clicked ChatGPT Stop")
         except Exception as exc:
             log.debug("Could not click ChatGPT Stop: %s", exc)
 
     async def _click_send(self) -> SendButtonState:
         """Try to click Send, distinguishing disabled from missing controls."""
+        from src.selectors import Selectors
+
         # Check send button state before clicking
         btn_state = await self._page.evaluate(
             """
             () => {
                 const selectors = [
+                    "button[aria-label='Send' i]",
+                    "button[aria-label='Send message']",
+                    "button[aria-label='Send prompt']",
                     'button[data-testid="send-button"]',
                     '#composer-submit-button',
-                    "button[aria-label='Send prompt']",
                 ];
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                };
                 for (const sel of selectors) {
-                    const btn = document.querySelector(sel);
-                    if (btn) {
+                    const candidates = Array.from(document.querySelectorAll(sel));
+                    const matchIndex = candidates.findIndex(isVisible);
+                    if (matchIndex >= 0) {
+                        const btn = candidates[matchIndex];
                         return {
                             selector: sel,
-                            disabled: btn.disabled,
+                            matchIndex,
+                            disabled: Boolean(btn.disabled),
                             ariaDisabled: btn.getAttribute('aria-disabled'),
-                            visible: btn.offsetParent !== null,
+                            visible: true,
                             classes: btn.className.substring(0, 100),
                         };
                     }
@@ -1449,11 +1666,37 @@ class ChatGPTClient:
             log.warning("Send button is disabled — refusing to submit with Enter")
             return "disabled"
 
-        selector = await self._find_selector(Selectors.SEND_BUTTON, "send button")
-        if selector:
-            await human_click(self._page, selector)
-            log.info(f"Send button clicked via: {selector}")
-            return "clicked"
+        # Fast path: click the selector that was already detected and verified
+        if isinstance(btn_state, dict) and btn_state.get("selector") and btn_state.get("visible"):
+            try:
+                selector = btn_state["selector"]
+                match_index = int(btn_state.get("matchIndex") or 0)
+                await human_click(self._page, selector, match_index)
+                log.info("Send button clicked via: %s (visible match %d)", selector, match_index)
+                return "clicked"
+            except Exception as e:
+                log.debug(f"Direct click on {btn_state.get('selector')} failed: {e}")
+
+        # Only click a visible exact send control. Never fall back to a generic
+        # button adjacent to the composer: ChatGPT places model/reasoning
+        # controls in that area and a broad selector can open them instead.
+        for selector in Selectors.SEND_BUTTON:
+            locator = self._page.locator(selector)
+            try:
+                for index in range(await locator.count()):
+                    candidate = locator.nth(index)
+                    if not await candidate.is_visible():
+                        continue
+                    if await candidate.is_disabled():
+                        return "disabled"
+                    aria_disabled = (await candidate.get_attribute("aria-disabled") or "").lower()
+                    if aria_disabled == "true":
+                        return "disabled"
+                    await human_click(self._page, selector, index)
+                    log.info("Send button clicked via: %s (visible match %d)", selector, index)
+                    return "clicked"
+            except Exception as exc:
+                log.debug("Could not click visible send match for %s: %s", selector, exc)
         return "missing"
 
     async def _detect_current_model_label(self) -> str:

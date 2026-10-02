@@ -125,16 +125,16 @@ async def human_type(page: Page, selector: str, text: str) -> None:
         log.debug(f"Could not verify text insertion: {e}")
 
 
-async def human_click(page: Page, selector: str) -> None:
+async def human_click(page: Page, selector: str, index: int = 0) -> None:
     """
     Click an element with human-like behavior:
     1. Hover over element (triggers mouseover)
     2. Brief pause
     3. Click
 
-    Uses .first to handle cases where multiple elements match.
+    Uses the requested matching element when a selector has multiple matches.
     """
-    element = page.locator(selector).first
+    element = page.locator(selector).nth(index)
     await element.hover()
     await asyncio.sleep(random.uniform(0.02, 0.06))
     await element.click()

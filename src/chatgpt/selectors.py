@@ -20,11 +20,11 @@ class ChatGPTSelectors:
     ]
 
     SEND_BUTTON = [
+        "button[aria-label='Send' i]",
+        "button[aria-label='Send message']",
+        "button[aria-label='Send prompt']",
         "button[data-testid='send-button']",
         "#composer-submit-button",
-        "button[aria-label='Send prompt']",
-        "button[aria-label*='Send' i]",
-        "#prompt-textarea ~ button",
     ]
 
     MODEL_PICKER_BUTTON = [
@@ -48,19 +48,29 @@ class ChatGPTSelectors:
         ".agent-turn",
         "section[data-turn='assistant']",
         "section[data-testid^='conversation-turn-']",
+        "[data-turn-key]",
+        "[data-content-search-turn-key]",
+        "[data-chatgpt-search-unit-key]",
+        "[class*='MarkdownRoot']",
+        ".turn-action-controls",
     ]
 
     STOP_BUTTON = [
         "button[data-testid='stop-button']",
         "button[aria-label='Stop answering']",
         "button[aria-label='Stop generating']",
+        "button[aria-label='Stop streaming']",
         "button[aria-label*='Stop' i]",
+        "button[data-testid*='stop' i]",
     ]
 
     NEW_CHAT_BUTTON = [
         "a[data-testid='create-new-chat-button']",
         "a[href='/']",
         "nav a[href='/']",
+        "a:has-text('New chat')",
+        "button:has-text('New chat')",
+        "[aria-label*='New chat' i]",
     ]
 
     SIDEBAR_THREAD_LINKS = [
@@ -79,6 +89,7 @@ class ChatGPTSelectors:
         "div[data-message-author-role='assistant'] .prose",
         "section[data-turn='assistant'] .markdown",
         "section[data-turn='assistant'] .prose",
+        "[class*='MarkdownRoot']:not([data-markdown-text-tone='user-message'])",
     ]
 
     POST_RESPONSE_BUTTONS = [
@@ -91,6 +102,8 @@ class ChatGPTSelectors:
         "button[data-testid='copy-turn-action-button']",
         "button[data-testid*='copy-turn' i]",
         "button[aria-label='Copy message']",
+        "button[aria-label='Copy']",
+        "button[aria-label*='Copy' i]",
     ]
 
     ASSISTANT_IMAGE = [

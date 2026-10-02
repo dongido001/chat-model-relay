@@ -22,8 +22,14 @@ log = setup_logging("gemini_detector")
 _SNAPSHOT_JS = """
 () => {
     const stop = document.querySelector(
-        'button[aria-label="Stop responding"], button[aria-label="Stop generating"]'
+        'button[aria-label="Stop responding"], button[aria-label="Stop generating"], button[aria-label="Stop response"], button[aria-label="Stop"], button[aria-label*="Stop" i], button[data-test-id*="stop" i]'
     );
+    const hasAnswerNow = Array.from(document.querySelectorAll('button')).some(btn => {
+        const txt = (btn.innerText || '').trim().toLowerCase();
+        const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+        return txt === 'answer now' || aria.includes('answer now');
+    });
+    const isStreaming = Boolean(stop) || hasAnswerNow;
     const copySelector = 'button[aria-label="Copy response"], button[aria-label="Copy"], button[aria-label*="Copy" i]';
     const nodes = Array.from(document.querySelectorAll(
         'model-response, .model-response-text, [data-test-id="model-response-text"], message-content, .response-content, .markdown.markdown-main-panel'
@@ -46,7 +52,7 @@ _SNAPSHOT_JS = """
             index: nodes.length - 1,
             signature: null,
             hasCopyButton: false,
-            isStreaming: Boolean(stop),
+            isStreaming,
             text: '',
         };
     }
@@ -57,7 +63,7 @@ _SNAPSHOT_JS = """
         index: idx,
         signature,
         hasCopyButton,
-        isStreaming: Boolean(stop),
+        isStreaming,
         text,
     };
 }

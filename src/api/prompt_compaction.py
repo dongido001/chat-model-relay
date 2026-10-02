@@ -49,11 +49,15 @@ def _latest_turn_messages(messages: list[ChatMessage], *, include_system: bool =
         return []
     systems = [message for message in messages if message.role == "system"] if include_system else []
     latest: list[ChatMessage] = []
+    found_user = False
     for message in reversed(messages):
+        # Editors may split a single turn into question, image and context
+        # messages. Keep the whole contiguous user block, not just its tail.
+        if found_user and message.role != "user":
+            break
         if message.role in {"user", "tool"}:
             latest.insert(0, message)
-            if message.role == "user":
-                break
+            found_user = found_user or message.role == "user"
     if not latest:
         non_system = [message for message in messages if message.role != "system"]
         latest = non_system[-1:]
@@ -99,25 +103,27 @@ def _file_attachment_key(attachment: dict) -> str:
 
 
 def _new_attachments_from_latest_user(messages: list[ChatMessage]) -> tuple[list[str], list[dict]]:
-    latest = _latest_user_message(messages)
-    if latest is None or not isinstance(latest.content, list):
-        return [], []
-
+    turn_users = [m for m in _latest_turn_messages(messages, include_system=False) if m.role == "user"]
+    current_ids = {id(m) for m in turn_users}
     prior_urls: set[str] = set()
     prior_files: set[str] = set()
     for message in messages:
-        if message is latest or message.role != "user" or not isinstance(message.content, list):
+        if id(message) in current_ids or message.role != "user":
             continue
         prior_urls.update(_extract_image_urls(message.content))
-        for attachment in _extract_file_attachments(message.content):
-            prior_files.add(_file_attachment_key(attachment))
+        prior_files.update(_file_attachment_key(a) for a in _extract_file_attachments(message.content))
 
-    image_urls = [url for url in _extract_image_urls(latest.content) if url not in prior_urls]
-    files = [
-        attachment
-        for attachment in _extract_file_attachments(latest.content)
-        if _file_attachment_key(attachment) not in prior_files
-    ]
+    image_urls, files = [], []
+    for message in turn_users:
+        for url in _extract_image_urls(message.content):
+            if url not in prior_urls:
+                image_urls.append(url)
+                prior_urls.add(url)
+        for attachment in _extract_file_attachments(message.content):
+            key = _file_attachment_key(attachment)
+            if key not in prior_files:
+                files.append(attachment)
+                prior_files.add(key)
     return image_urls, files
 
 

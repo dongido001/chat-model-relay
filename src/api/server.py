@@ -31,6 +31,7 @@ from src.config import Config
 from src.api.ollama_routes import ollama_router
 from src.api.routes import router, set_client
 from src.api.openai_routes import openai_router, set_openai_client
+from src.api.admin_routes import router as admin_router
 from src.api.browser_gate import configure_tab_pool
 from src.api.observability import RequestObservabilityMiddleware, metrics
 from src.log import setup_logging
@@ -278,7 +279,7 @@ class BearerTokenMiddleware:
             return
 
         path_str = scope.get("path", "")
-        if path_str in {"/docs", "/redoc", "/openapi.json", "/healthz"}:
+        if path_str in {"/docs", "/redoc", "/openapi.json", "/healthz", "/admin", "/dashboard"} or path_str.startswith("/admin/") or path_str.startswith("/dashboard/"):  
             await self.app(scope, receive, send)
             return
 
@@ -290,8 +291,8 @@ class BearerTokenMiddleware:
         auth_header = headers.get("authorization", "")
         x_api_key = (headers.get("x-api-key") or "").strip()
         anthropic_api_key = (headers.get("anthropic-api-key") or "").strip()
-        if Config.API_TOKEN_OPTIONAL and not auth_header and not x_api_key and not anthropic_api_key:
-            # Optional-auth mode: no header is allowed.
+        if Config.API_TOKEN_OPTIONAL:
+            # Optional-auth mode: accept all local requests regardless of header value
             await self.app(scope, receive, send)
             return
 
@@ -336,6 +337,15 @@ app.add_middleware(RequestObservabilityMiddleware)
 app.include_router(router)
 app.include_router(openai_router)
 app.include_router(ollama_router)
+app.include_router(admin_router)
+
+# Mount Vue 3 dashboard static build assets
+from pathlib import Path
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_vue_assets_dir = _PROJECT_ROOT / "dashboard" / "dist" / "assets"
+if _vue_assets_dir.exists():
+    from starlette.staticfiles import StaticFiles
+    app.mount("/dashboard/assets", StaticFiles(directory=str(_vue_assets_dir)), name="dashboard_assets")
 
 
 @app.get("/healthz", include_in_schema=False)

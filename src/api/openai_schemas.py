@@ -11,7 +11,7 @@ import time
 import uuid
 from typing import Any, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ── Tool / Function definitions ─────────────────────────────────
@@ -25,9 +25,26 @@ class FunctionDefinition(BaseModel):
 
 
 class ToolDefinition(BaseModel):
-    """A tool the model may use (only 'function' type supported)."""
+    """A function tool in either Chat Completions or Responses API format."""
     type: str = "function"
     function: FunctionDefinition
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_responses_function_tool(cls, value: Any) -> Any:
+        """Accept the flat Responses API function-tool shape used by Codex."""
+        if not isinstance(value, dict) or "function" in value:
+            return value
+        if value.get("type") != "function" or not value.get("name"):
+            return value
+        return {
+            "type": "function",
+            "function": {
+                "name": value["name"],
+                "description": value.get("description", ""),
+                "parameters": value.get("parameters") or {},
+            },
+        }
 
 
 class FunctionCallInfo(BaseModel):
@@ -101,6 +118,8 @@ class ChatCompletionRequest(BaseModel):
     reasoning: Optional[ReasoningOptions] = None
     # Durable logical conversation identity (also accepted via header).
     conversation_id: Optional[str] = None
+    # CatGPT extension: group independent editor chats onto one project thread.
+    project_id: Optional[str] = None
     # CatGPT extension: explicit thread targeting for app-level isolation.
     thread_id: Optional[str] = None
     response_format: Optional[Any] = None
@@ -224,6 +243,8 @@ class ResponseInputItem(BaseModel):
     type: str = "message"
     role: str = "user"
     content: Optional[Union[str, List[Any]]] = None
+    call_id: Optional[str] = None
+    output: Optional[Union[str, List[Any]]] = None
 
 
 class ResponsesRequest(BaseModel):
@@ -245,9 +266,28 @@ class ResponsesRequest(BaseModel):
     reasoning: Optional[ReasoningOptions] = None
     conversation: Optional[Union[str, dict[str, Any]]] = None
     previous_response_id: Optional[str] = None
+    # CatGPT extension: group independent Responses API sessions by workspace.
+    project_id: Optional[str] = None
     store: Optional[bool] = True
     # CatGPT extension
     read_aloud: Optional[bool] = False
+
+    @field_validator("tools", mode="before")
+    @classmethod
+    def expand_namespace_tools(cls, value: Any) -> Any:
+        """Flatten Codex's Responses API namespace tool groups into functions."""
+        if not isinstance(value, list):
+            return value
+        flattened: list[Any] = []
+        for tool in value:
+            if isinstance(tool, dict) and tool.get("type") == "namespace":
+                nested = tool.get("tools")
+                if isinstance(nested, list):
+                    flattened.extend(nested)
+                    continue
+            if isinstance(tool, dict) and tool.get("type") == "function":
+                flattened.append(tool)
+        return flattened
 
 
 class ResponseOutputText(BaseModel):
@@ -267,8 +307,9 @@ class ResponseOutputMessage(BaseModel):
 
 class ResponseOutputToolCall(BaseModel):
     """A tool call output item in the Responses API response."""
-    type: str = "tool_call"
+    type: str = "function_call"
     id: str = Field(default_factory=lambda: f"call_{uuid.uuid4().hex[:24]}")
+    call_id: str = ""
     name: str = ""
     arguments: str = ""
 

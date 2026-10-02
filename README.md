@@ -2,38 +2,53 @@
 
 # Chat Model Relay
 
-**A browser-backed AI gateway for ChatGPT and Gemini.**
-Connect VS Code and other OpenAI-compatible clients to one persistent gateway.
+**A browser-backed AI gateway for ChatGPT and Gemini.**  
+Connect VS Code, Cursor, Copilot, Cline, and other OpenAI-compatible clients to one persistent gateway.
 
-[Quick Start](#quick-start) · [VS Code setup](#vs-code-setup) · [Core capabilities](#core-capabilities) · API · Environment · Setup · Architecture
+[Quick Start](#quick-start) · [Gateway Dashboard](#gateway-dashboard) · [VS Code setup](#vs-code-setup) · [Core capabilities](#core-capabilities) · [API Reference](docs/API.md)
 
 ---
 
 Chat Model Relay turns a logged-in browser session into familiar API endpoints. ChatGPT and Gemini use persistent, automated browser sessions. It is designed for private, self-hosted integrations—not as an official provider API.
 
-The core flow is simple: **VS Code or another client → Chat Model Relay gateway → persistent browser/provider → normalized API response**. VS Code is the primary target; Cursor, Cline, and other compatible clients are supported as compatibility targets and should be verified in your own setup.
+The core flow is simple: **VS Code / IDE client → Chat Model Relay gateway → persistent browser/provider → normalized API response**. VS Code is the primary target; Cursor, Copilot, Cline, and other compatible clients are supported as compatibility targets.
 
-> **Experimental software and disclaimer**
+![Chat Model Relay Gateway Dashboard](assets/gateway_dashboard.png)
+
+> **Experimental software and disclaimer**  
 > Chat Model Relay is provided for experimentation and personal testing. Use it at your own risk. The authors and contributors are not responsible for damage, data loss, account restrictions, service interruptions, or misuse resulting from this project. Follow the terms and policies of every provider you connect, and never expose the gateway or commit credentials without securing it first.
 
 ## Core capabilities
 
-- **Client-compatible API surfaces:** OpenAI-compatible endpoints let VS Code and other IDE tools connect to the configured provider. Available model IDs and capabilities depend on the provider and endpoint.
-- **Persistent provider sessions:** Browser-backed ChatGPT and Gemini sessions with thread and application isolation.
+- **Operational Gateway Dashboard:** A real-time Web UI for monitoring active queue concurrency, browser tab allocations, memory usage, loopback latency, and inspecting/managing persistent project and thread routes.
+- **Client-compatible API surfaces:** OpenAI-compatible endpoints (`/v1/chat/completions`, `/v1/models`, `/v1/images/generations`) and Ollama-compatible endpoints (`/api/chat`, `/api/generate`) allow any IDE or LLM client to connect.
+- **Persistent provider sessions:** Browser-backed ChatGPT and Gemini sessions with thread, tab, and application isolation.
 - **Rich requests:** Tool calls, vision, file attachments, image generation, audio capture, and JSON Schema output for supported providers.
 - **Reliable operations:** Long-prompt fallback, response normalization, health checks, configurable authentication, and Docker deployment.
 
-> **Tip**
+> **Tip**  
 > Long-prompt fallback is enabled by default. If ChatGPT disables direct submission, Chat Model Relay uploads the complete request as a temporary UTF-8 attachment. This avoids freezing the browser composer, but it depends on the provider accepting file uploads and adds upload time. The flow has been validated with a 1.4-million-character request.
+
+## Gateway Dashboard
+
+The built-in web gateway dashboard is accessible at `http://localhost:8001/` (or port `8650` when deployed via Docker Compose).
+
+### Key Features
+- **Live Relay Telemetry:** Real-time metrics tracking active queue concurrency, browser tab allocations, memory usage, total requests handled, and average loopback response latency.
+- **Quick Connect & Tools:** Single-click launcher shortcuts for:
+  - **ChatGPT Browser** (`:5800` noVNC Active)
+  - **Gemini Browser** (`:5801` noVNC Active)
+  - **Swagger API Docs** (`/docs` Interactive UI)
+  - **Ollama API** (`/api/chat` Native)
+- **Available Models:** Live view of registered model aliases (`catgpt-browser`, `gemini-browser`, `gpt-5.6-sol`, `gpt-5.5-thinking`).
+- **Mapped Project & Conversation Routes:** Searchable SQLite route table mapping IDE projects and conversation keys to active browser thread IDs, complete with inspection and deletion controls.
 
 ## Providers
 
-
-| Provider | Connection         | Model                                    | Notable capabilities                                         |
-| -------- | ------------------ | ---------------------------------------- | ------------------------------------------------------------ |
-| ChatGPT  | Persistent browser | `catgpt-browser` or configured GPT model | Images, vision, files, audio, model/effort switching         |
-| Gemini   | Persistent browser | `gemini-browser`                         | Chat, vision, files, tools (Google account login in the GUI) |
-
+| Provider | Connection | Model | Notable capabilities |
+| --- | --- | --- | --- |
+| ChatGPT | Persistent browser | `catgpt-browser` or configured GPT model | Images, vision, files, audio, model/effort switching |
+| Gemini | Persistent browser | `gemini-browser` | Chat, vision, files, tools (Google account login in the GUI) |
 
 ## Quick Start
 
@@ -63,14 +78,13 @@ See the [generated environment reference](docs/ENVIRONMENT.md) for every setting
 docker compose up -d
 ```
 
-
-| Service               | Address                 |
-| --------------------- | ----------------------- |
+| Service | Address |
+| --- | --- |
+| Gateway Dashboard | `http://localhost:8650` |
 | ChatGPT browser login | `http://localhost:5800` |
-| ChatGPT API gateway   | `http://localhost:8650` |
-| Gemini browser login  | `http://localhost:5801` |
-| Gemini API gateway    | `http://localhost:8651` |
-
+| ChatGPT API gateway | `http://localhost:8650` |
+| Gemini browser login | `http://localhost:5801` |
+| Gemini API gateway | `http://localhost:8651` |
 
 `docker compose up -d` starts both ChatGPT and Gemini containers from the same image. Open `http://localhost:5800` and sign in to ChatGPT. Open `http://localhost:5801` and sign in to Gemini with a Google account (2FA/passkeys are done in that GUI). Profiles persist separately under `appdata/catgpt/` and `appdata/catgpt-gemini/`. If you set `RELAY_VNC_PASSWORD`, enter it when prompted.
 
@@ -119,17 +133,7 @@ You can add Chat Model Relay as a custom language-model endpoint in VS Code. Sta
 
 3. Choose **Custom Endpoint**.
 
-   ![Choose Custom Endpoint](./docs/images/vscode/03-add-models-menu.png)
-
-4. For **Group Name**, enter `Chat Model Relay — ChatGPT` or any prefered name.
-
-   ![Enter the group name](./docs/images/vscode/04-group-name.png)
-
-5. For **API Key**, enter the value of `RELAY_API_KEY` from your `.env`. If authentication is optional and no key is configured, enter `dummy123` or any prefered name.
-
-   ![Enter the API key](./docs/images/vscode/05-api-key.png)
-
-6. For **API Type**, choose **Chat Completions**.
+4. For **API Type**, choose **Chat Completions**.
 
    ![Choose the API type](./docs/images/vscode/06-api-type.png)
 
@@ -139,7 +143,7 @@ You can add Chat Model Relay as a custom language-model endpoint in VS Code. Sta
    | Model ID | `catgpt-browser` |
    | Base URL | `http://localhost:8650/v1` |
 
-8. Save the model, select it in the Chat view, and send a short test message.
+5. Save the model, select it in the Chat view, and send a short test message.
 
 To add Gemini, repeat the same steps with **Group Name** `Chat Model Relay — Gemini`, **Model ID** `gemini-browser`, and **Base URL** `http://localhost:8651/v1`. Use the Gemini gateway only after signing in through `http://localhost:5801`.
 
@@ -147,26 +151,23 @@ If you configured `API_TOKEN_OPTIONAL=false`, the API key must match `RELAY_API_
 
 ## API Surfaces
 
-
-| Client ecosystem | Primary endpoints                                                               |
-| ---------------- | ------------------------------------------------------------------------------- |
-| OpenAI           | `/v1/chat/completions`, `/v1/responses`, `/v1/images/generations`, `/v1/models` |
-| Ollama           | `/api/chat`, `/api/generate`, `/api/embed`, `/api/tags`                         |
-| Cline / OpenCode | `/cline/v1/chat/completions` (OpenAI-compatible; SSE `stream=true`)             |
-| Native CatGPT    | `/chat`, `/thread/{id}/chat`, `/thread/new`, `/threads`, `/status`              |
-
+| Client ecosystem | Primary endpoints |
+| --- | --- |
+| Gateway Dashboard | `/`, `/dashboard`, `/api/admin/status`, `/api/admin/routes` |
+| OpenAI | `/v1/chat/completions`, `/v1/responses`, `/v1/images/generations`, `/v1/models` |
+| Ollama | `/api/chat`, `/api/generate`, `/api/embed`, `/api/tags` |
+| Cline / OpenCode | `/cline/v1/chat/completions` (OpenAI-compatible; SSE `stream=true`) |
+| Native CatGPT | `/chat`, `/thread/{id}/chat`, `/thread/new`, `/threads`, `/status` |
 
 Use `/{app_name}/v1/...` or `/{app_name}/api/...` routes to isolate applications such as VS Code, Cursor, Cline, Open WebUI, Mealie, Linkwarden, or internal agents.
 
-
-| Identifier                                     | Use it when                                                                          | Scope                |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------ | -------------------- |
-| `conversation_id` / `X-CatGPT-Conversation-Id` | You need durable, history-verified continuity across requests                        | Logical conversation |
-| `thread_id`                                    | You need to target a known provider browser thread directly                          | Provider thread      |
-| `x-session-id`                                 | Your client has a stable session/tab identifier but does not manage conversation IDs | Browser tab affinity |
-| `/{app_name}/...`                              | You want separate routing for each client or application                             | App namespace        |
-| `X-CatGPT-Thread-Mode: fresh`                  | You need a one-off isolated browser thread                                           | New ephemeral thread |
-
+| Identifier | Use it when | Scope |
+| --- | --- | --- |
+| `conversation_id` / `X-CatGPT-Conversation-Id` | You need durable, history-verified continuity across requests | Logical conversation |
+| `thread_id` | You need to target a known provider browser thread directly | Provider thread |
+| `x-session-id` | Your client has a stable session/tab identifier but does not manage conversation IDs | Browser tab affinity |
+| `/{app_name}/...` | You want separate routing for each client or application | App namespace |
+| `X-CatGPT-Thread-Mode: fresh` | You need a one-off isolated browser thread | New ephemeral thread |
 
 Cursor does not send those headers by default. With `API_DERIVE_CONVERSATION_ID=true` (the default), CatGPT isolates each Cursor chat: `x-session-id` becomes the conversation id when present, otherwise the first user turn is hashed. Follow-ups that still include that first turn stay on the same ChatGPT/Gemini thread. Set `API_DERIVE_CONVERSATION_ID=false` to restore one shared thread per Copilot/Cursor app.
 
@@ -184,34 +185,30 @@ In Cline, choose **OpenAI Compatible**, set Base URL to `http://localhost:8650/c
 
 ## Essential Configuration
 
-
-| Variable                        | Default              | Purpose                                                                                                                                                   |
-| ------------------------------- | -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PROVIDER`                      | `chatgpt`            | Select `chatgpt` or `gemini` for a standalone process. Docker Compose runs Gemini separately as `catgpt-gemini` on ports 8651/5801. |
-| `RELAY_API_KEY`                | Empty                | Optional bearer token for the local-only Compose setup; required before network exposure                                                                  |
-| `RELAY_VNC_PASSWORD`           | Empty                | Optional browser GUI password                                                                                                                             |
-| `MAX_CONCURRENT_REQUESTS`       | `3`                  | Maximum concurrent browser-backed requests                                                                                                                |
-| `SLOW_MO`                       | `0`                  | Extra Playwright delay (ms); keep at 0 for responsiveness                                                                                                 |
-| `CHATGPT_DEFAULT_MODEL`         | Current UI selection | Default ChatGPT model mapping                                                                                                                             |
-| `CHATGPT_PROJECT_URL`           | Empty                | Confine ChatGPT threads to one project                                                                                                                    |
-| `CHATGPT_LONG_PROMPT_THRESHOLD` | `8000` in Compose    | Character threshold for uploading oversized prompts as temporary attachments                                                                              |
-
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PROVIDER` | `chatgpt` | Select `chatgpt` or `gemini` for a standalone process. Docker Compose runs Gemini separately as `catgpt-gemini` on ports 8651/5801. |
+| `RELAY_API_KEY` | Empty | Optional bearer token for the local-only Compose setup; required before network exposure |
+| `RELAY_VNC_PASSWORD` | Empty | Optional browser GUI password |
+| `MAX_CONCURRENT_REQUESTS` | `3` | Maximum concurrent browser-backed requests |
+| `SLOW_MO` | `0` | Extra Playwright delay (ms); keep at 0 for responsiveness |
+| `CHATGPT_DEFAULT_MODEL` | Current UI selection | Default ChatGPT model mapping |
+| `CHATGPT_PROJECT_URL` | Empty | Confine ChatGPT threads to one project |
+| `CHATGPT_LONG_PROMPT_THRESHOLD` | `8000` in Compose | Character threshold for uploading oversized prompts as temporary attachments |
 
 See the [generated environment reference](docs/ENVIRONMENT.md), [docker-compose.yml](docker-compose.yml), and the [Setup Guide](docs/SETUP.md) for advanced options. Add runtime-only Docker overrides under `services.catgpt.environment`.
 
 ## Documentation
 
-
-| Guide                                               | What it covers                                                          |
-| --------------------------------------------------- | ----------------------------------------------------------------------- |
-| [API Reference](docs/API.md)                        | Request formats, tools, vision, files, images, audio, and native routes |
-| [Environment Reference](docs/ENVIRONMENT.md)        | Every runtime and Docker Compose variable, default, and purpose         |
-| [Setup Guide](docs/SETUP.md)                        | Docker, local installation, login, persistence, and troubleshooting     |
-| [Model Switching](docs/MODEL_SWITCHING.md)          | ChatGPT model aliases, versions, and effort settings                    |
-| [Architecture](docs/ARCHITECTURE.md)                | Browser lifecycle, routing, extraction, and response detection          |
-| [Chrome Runbook](docs/CHROME_PLAYWRIGHT_RUNBOOK.md) | Browser automation diagnostics and recovery                             |
-| [Testing Guide](docs/TESTING.md)                    | Reproducible unit, environment, container, and browser smoke checks     |
-
+| Guide | What it covers |
+| --- | --- |
+| [API Reference](docs/API.md) | Request formats, tools, vision, files, images, audio, and native routes |
+| [Environment Reference](docs/ENVIRONMENT.md) | Every runtime and Docker Compose variable, default, and purpose |
+| [Setup Guide](docs/SETUP.md) | Docker, local installation, login, persistence, and troubleshooting |
+| [Model Switching](docs/MODEL_SWITCHING.md) | ChatGPT model aliases, versions, and effort settings |
+| [Architecture](docs/ARCHITECTURE.md) | Browser lifecycle, routing, extraction, and response detection |
+| [Chrome Runbook](docs/CHROME_PLAYWRIGHT_RUNBOOK.md) | Browser automation diagnostics and recovery |
+| [Testing Guide](docs/TESTING.md) | Reproducible unit, environment, container, and browser smoke checks |
 
 ## Operational Notes
 
