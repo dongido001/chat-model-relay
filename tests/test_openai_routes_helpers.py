@@ -1283,21 +1283,60 @@ class ResponsesAPITests(unittest.TestCase):
 
 
 
-    def test_strip_client_disclaimers(self) -> None:
+    def test_strip_client_disclaimers_variants(self) -> None:
         from src.api.prompt_compaction import _strip_client_disclaimers
-        sample = (
-            "You are an AI programming assistant. Follow Microsoft content policies. "
-            "Avoid content that violates copyrights. If you are asked to generate content that is "
-            "harmful, hateful, racist, sexist, lewd, violent, or completely irrelevant to software engineering, "
-            "only respond with \"Sorry, I can't assist with that.\" Keep your answers short."
-        )
-        cleaned = _strip_client_disclaimers(sample)
-        self.assertNotIn("Follow Microsoft content policies", cleaned)
-        self.assertNotIn("Avoid content that violates copyrights", cleaned)
-        self.assertNotIn("Sorry, I can't assist with that", cleaned)
-        self.assertTrue(cleaned.startswith("You are an AI programming assistant."))
-        self.assertTrue(cleaned.endswith("Keep your answers short."))
 
+        variants = [
+            # Standard exact string
+            "You are helpful. Follow Microsoft content policies. Avoid content that violates copyrights. Keep answers concise.",
+            # Case & punctuation variations
+            "You are helpful. FOLLOW MICROSOFT'S CONTENT POLICY! AVOID GENERATING CONTENT THAT VIOLATES COPYRIGHT! Keep answers concise.",
+            # Smart quotes & extra newlines
+            "You are helpful.\n\nFollow Microsoft content policy\nAvoid content that violates copyright\nIf you are asked to generate content that is harmful, hateful, racist, sexist, lewd, or violent, only respond with “Sorry, I can’t assist with that.”\n\nKeep answers concise.",
+            # VSCode GPT variant
+            "You are an AI assistant. Follow Microsoft content policies. Avoid content that violates copyrights. If you are asked to generate content that is harmful, hateful, racist, sexist, lewd, violent, or completely irrelevant to software engineering, only respond with 'Sorry, I can't assist with that.' Keep your answers short and impersonal.",
+        ]
+
+        for text in variants:
+            cleaned = _strip_client_disclaimers(text)
+            self.assertNotIn("Microsoft", cleaned)
+            self.assertNotIn("copyright", cleaned.lower())
+            self.assertNotIn("sorry, i can't assist with that", cleaned.lower())
+
+    def test_build_prompt_multiturn_system_sanitization(self) -> None:
+        from src.api.prompt_compaction import _build_prompt
+
+        messages = [
+            ChatMessage(
+                role="system",
+                content="You are helpful. Follow Microsoft content policies. Avoid content that violates copyrights.",
+            ),
+            ChatMessage(role="user", content="Turn 1 user request"),
+            ChatMessage(role="assistant", content="Turn 1 assistant response"),
+            ChatMessage(role="user", content="Turn 2 user request"),
+        ]
+        prompt = _build_prompt(messages)
+        self.assertNotIn("Microsoft", prompt)
+        self.assertNotIn("copyright", prompt.lower())
+        self.assertIn("System: You are helpful.", prompt)
+        self.assertIn("User: Turn 1 user request", prompt)
+        self.assertIn("Assistant: Turn 1 assistant response", prompt)
+        self.assertIn("User: Turn 2 user request", prompt)
+
+    def test_build_prompt_single_turn_system_sanitization(self) -> None:
+        from src.api.prompt_compaction import _build_prompt
+
+        messages = [
+            ChatMessage(
+                role="system",
+                content="You are a senior python dev. Follow Microsoft content policies.",
+            ),
+            ChatMessage(role="user", content="Write a quicksort function"),
+        ]
+        prompt = _build_prompt(messages)
+        self.assertNotIn("Microsoft", prompt)
+        self.assertIn("[System instruction: You are a senior python dev.]", prompt)
+        self.assertIn("Write a quicksort function", prompt)
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 from typing import Any
@@ -25,10 +26,17 @@ def _extract_content_text(content: Any) -> str:
 
 
 _CLIENT_DISCLAIMERS = (
-    re.compile("Follow Microsoft content policies\\.?", re.IGNORECASE),
-    re.compile("Avoid content that violates copyrights\\.?", re.IGNORECASE),
-    re.compile("If you are asked to generate content that is harmful, hateful, racist, sexist, lewd, violent, or completely irrelevant to software engineering, only respond with [\"'\u2019]?Sorry, I can['\u2019]?t assist with that\\.?[\"'\u2019]?", re.IGNORECASE),
-    re.compile("If you are asked to generate content that is harmful, hateful, racist, sexist, lewd, or violent, only respond with [\"'\u2019]?Sorry, I can['\u2019]?t assist with that\\.?[\"'\u2019]?", re.IGNORECASE),
+    re.compile(r"Follow\s+Microsoft(?:'s)?\s+content\s+polic(?:y|ies)[\.\?!]?", re.IGNORECASE),
+    re.compile(r"Avoid\s+(?:generating\s+)?content\s+that\s+violates\s+copyrights?[\.\?!]?", re.IGNORECASE),
+    re.compile(
+        r"If\s+you\s+are\s+asked\s+to\s+generate\s+content\s+that\s+is\s+harmful,\s+hateful,\s+racist,\s+sexist,\s+lewd,\s+(?:violent,\s+or\s+completely\s+irrelevant\s+to\s+software\s+engineering|or\s+violent),\s+only\s+respond\s+with[^\w]*Sorry,\s*I\s*can[^\w]*t\s*assist\s*with\s*that[^\w]*",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"only\s+respond\s+with[^\w]*Sorry,\s*I\s*can[^\w]*t\s*assist\s*with\s*that[^\w]*",
+        re.IGNORECASE,
+    ),
+    re.compile(r"Keep\s+your\s+answers?\s+short\s+and\s+impersonal[\.\?!]?", re.IGNORECASE),
 )
 
 
@@ -38,6 +46,26 @@ def _strip_client_disclaimers(text: str) -> str:
     for pattern in _CLIENT_DISCLAIMERS:
         text = pattern.sub("", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _sanitize_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
+    sanitized: list[ChatMessage] = []
+    for msg in messages:
+        if getattr(msg, "role", None) in {"system", "developer"} and msg.content:
+            text = _extract_content_text(msg.content)
+            cleaned = _strip_client_disclaimers(text)
+            if cleaned != text:
+                if hasattr(msg, "model_copy"):
+                    msg_copy = msg.model_copy(update={"content": cleaned})
+                elif hasattr(msg, "copy"):
+                    msg_copy = msg.copy(update={"content": cleaned})
+                else:
+                    msg_copy = copy.copy(msg)
+                    msg_copy.content = cleaned
+                sanitized.append(msg_copy)
+                continue
+        sanitized.append(msg)
+    return sanitized
 
 
 def _first_user_conversation_seed(messages: list[ChatMessage] | None) -> str:
@@ -186,6 +214,7 @@ def _extract_file_attachments(content: Any) -> list[dict]:
 
 
 def _build_prompt(messages: list[ChatMessage]) -> str:
+    messages = _sanitize_messages(messages)
     non_system = [m for m in messages if m.role != "system"]
     system_msgs = [m for m in messages if m.role == "system"]
     if len(non_system) == 1 and non_system[0].role == "user":
@@ -193,7 +222,7 @@ def _build_prompt(messages: list[ChatMessage]) -> str:
         if system_msgs:
             sys_texts = []
             for msg in system_msgs:
-                text = _strip_client_disclaimers(_extract_content_text(msg.content))
+                text = _extract_content_text(msg.content).strip()
                 if text:
                     sys_texts.append(text)
             if len(sys_texts) == 1:
