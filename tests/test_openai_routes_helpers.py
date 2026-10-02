@@ -1282,5 +1282,22 @@ class ResponsesAPITests(unittest.TestCase):
         self.assertEqual(converted.messages[1].content, "Hello from Claude Code")
 
 
+
+    def test_strip_client_disclaimers(self) -> None:
+        from src.api.prompt_compaction import _strip_client_disclaimers
+        sample = (
+            "You are an AI programming assistant. Follow Microsoft content policies. "
+            "Avoid content that violates copyrights. If you are asked to generate content that is "
+            "harmful, hateful, racist, sexist, lewd, violent, or completely irrelevant to software engineering, "
+            "only respond with \"Sorry, I can't assist with that.\" Keep your answers short."
+        )
+        cleaned = _strip_client_disclaimers(sample)
+        self.assertNotIn("Follow Microsoft content policies", cleaned)
+        self.assertNotIn("Avoid content that violates copyrights", cleaned)
+        self.assertNotIn("Sorry, I can't assist with that", cleaned)
+        self.assertTrue(cleaned.startswith("You are an AI programming assistant."))
+        self.assertTrue(cleaned.endswith("Keep your answers short."))
+
+
 if __name__ == "__main__":
     unittest.main()

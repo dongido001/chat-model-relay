@@ -24,6 +24,22 @@ def _extract_content_text(content: Any) -> str:
     return str(content)
 
 
+_CLIENT_DISCLAIMERS = (
+    re.compile("Follow Microsoft content policies\\.?", re.IGNORECASE),
+    re.compile("Avoid content that violates copyrights\\.?", re.IGNORECASE),
+    re.compile("If you are asked to generate content that is harmful, hateful, racist, sexist, lewd, violent, or completely irrelevant to software engineering, only respond with [\"'\u2019]?Sorry, I can['\u2019]?t assist with that\\.?[\"'\u2019]?", re.IGNORECASE),
+    re.compile("If you are asked to generate content that is harmful, hateful, racist, sexist, lewd, or violent, only respond with [\"'\u2019]?Sorry, I can['\u2019]?t assist with that\\.?[\"'\u2019]?", re.IGNORECASE),
+)
+
+
+def _strip_client_disclaimers(text: str) -> str:
+    if not text:
+        return text
+    for pattern in _CLIENT_DISCLAIMERS:
+        text = pattern.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def _first_user_conversation_seed(messages: list[ChatMessage] | None) -> str:
     if not messages:
         return ""
@@ -177,7 +193,7 @@ def _build_prompt(messages: list[ChatMessage]) -> str:
         if system_msgs:
             sys_texts = []
             for msg in system_msgs:
-                text = _extract_content_text(msg.content).strip()
+                text = _strip_client_disclaimers(_extract_content_text(msg.content))
                 if text:
                     sys_texts.append(text)
             if len(sys_texts) == 1:
